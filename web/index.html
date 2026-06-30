@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>RealtimeDataPool · 实时盯盘</title>
+  <link rel="stylesheet" href="/assets/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">📊</span>
+      <span class="title">RealtimeDataPool</span>
+      <span class="subtitle">A 股实时盯盘 · 30s 刷新</span>
+    </div>
+    <div class="stats" id="stats">
+      <span class="stat"><b id="stat-pool">—</b> 只</span>
+      <span class="stat"><b id="stat-valid">—</b> 有效</span>
+      <span class="stat"><b id="stat-stale">—</b> 停牌</span>
+      <span class="stat">最近更新 <b id="stat-updated">—</b></span>
+      <span class="stat">下次 <b id="stat-next">—</b></span>
+      <span class="stat">来源 <b id="stat-source">—</b></span>
+      <span class="stat"><span id="stat-running" class="badge">—</span></span>
+    </div>
+  </header>
+
+  <section class="toolbar">
+    <input id="search" placeholder="搜索代码 / 名称（支持模糊）" />
+    <select id="category">
+      <option value="">全部</option>
+      <option value="stock">A股</option>
+      <option value="etf">ETF</option>
+      <option value="lof">LOF</option>
+    </select>
+    <label>涨跌幅 ≥ <input id="min-pct" type="number" step="0.1" placeholder="—" style="width:70px" /> %</label>
+    <label>≤ <input id="max-pct" type="number" step="0.1" placeholder="—" style="width:70px" /> %</label>
+    <label class="checkbox"><input id="only-active" type="checkbox" /> 只看有效</label>
+    <span class="spacer"></span>
+    <span class="count">显示 <b id="shown-count">0</b> / <b id="total-count">0</b></span>
+    <button id="refresh-now">立即刷新</button>
+  </section>
+
+  <main>
+    <table id="quotes">
+      <thead>
+        <tr>
+          <th data-sort="code">代码</th>
+          <th data-sort="name">名称</th>
+          <th data-sort="price" class="right">最新价</th>
+          <th data-sort="change_pct" class="right">涨跌幅</th>
+          <th data-sort="change" class="right">涨跌额</th>
+          <th data-sort="open" class="right">今开</th>
+          <th data-sort="high" class="right">最高</th>
+          <th data-sort="low" class="right">最低</th>
+          <th data-sort="prev_close" class="right">昨收</th>
+          <th data-sort="volume" class="right">成交量(手)</th>
+          <th data-sort="amount" class="right">成交额</th>
+          <th data-sort="turnover_pct" class="right">换手率%</th>
+          <th data-sort="pe" class="right">市盈率</th>
+          <th data-sort="market_cap" class="right">总市值</th>
+          <th class="right">买一/卖一</th>
+          <th>盘口</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </main>
+
+  <!-- 侧栏：单只详情 -->
+  <aside id="detail-panel" class="hidden">
+    <div class="detail-header">
+      <h2 id="detail-name">—</h2>
+      <span id="detail-code" class="muted">—</span>
+      <button id="detail-close">×</button>
+    </div>
+    <div class="detail-body">
+      <section class="kv">
+        <h3>实时行情</h3>
+        <div id="detail-quote" class="kv-grid"></div>
+      </section>
+      <section>
+        <h3>买卖盘口</h3>
+        <table class="orderbook">
+          <thead><tr><th>买价</th><th>买量</th><th></th><th>卖价</th><th>卖量</th></tr></thead>
+          <tbody id="detail-orderbook"></tbody>
+        </table>
+      </section>
+      <section>
+        <h3>近 50 条历史快照</h3>
+        <table class="history">
+          <thead><tr><th>时间</th><th>价</th><th>涨跌幅</th><th>成交额</th></tr></thead>
+          <tbody id="detail-history"></tbody>
+        </table>
+      </section>
+    </div>
+  </aside>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>

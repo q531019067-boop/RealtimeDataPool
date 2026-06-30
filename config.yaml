@@ -1,0 +1,24 @@
+pool:
+  fetch_interval_sec: 30
+  fetch_out_of_session: true
+  concurrency_per_source: 8
+  sources:
+  - eastmoney
+  - sina
+  - tencent
+  batch_size: 100
+instruments:
+  include_all_a_share: true
+  include_etf: true
+  extra_codes: []
+  exclude_codes: []
+  max_pool_size: 0
+storage:
+  db_path: data/rdp.db
+  retention_days: 7
+api:
+  host: 0.0.0.0
+  port: 5080
+logging:
+  level: INFO
+  file: logs/rdp.log

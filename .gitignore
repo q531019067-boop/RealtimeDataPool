@@ -1,0 +1,20 @@
+# RealtimeDataPool
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# 运行期数据
+data/instruments_cache.json
+data/rdp.db
+data/rdp.db-*
+logs/*.log
+logs/*.log.*
+
+# 临时
+*.tmp
+.DS_Store
+Thumbs.db
+.venv/
+venv/
+.env

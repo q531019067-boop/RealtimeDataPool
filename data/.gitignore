@@ -1,0 +1,5 @@
+# RealtimeDataPool 运行期数据
+- instruments_cache.json — 股票池缓存
+- rdp.db — SQLite 数据库
+
+这两个文件都不应 commit 到 git。
