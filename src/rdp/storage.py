@@ -429,7 +429,7 @@ class Storage:
         with self._write() as conn:
             cur = conn.execute("DELETE FROM snapshots WHERE fetched_at < ?", (cutoff,))
             deleted = cur.rowcount
-        logger.info("Cleaned up %d snapshots older than %d days", deleted, retention_days)
+        logger.debug("Cleaned up %d snapshots older than %d days", deleted, retention_days)
         return deleted
 
     # ---------- fetch_runs ----------
