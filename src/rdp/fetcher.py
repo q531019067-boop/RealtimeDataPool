@@ -11,16 +11,52 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Deque
 
 import aiohttp
 
 from .instruments import Instrument
 
 logger = logging.getLogger(__name__)
+
+
+# ---------- 反爬 / 礼貌请求参数 ----------
+
+# 每个请求前的随机 jitter 区间（毫秒）。小幅（<50ms）单次看不出，
+# 但打破"齐刷刷整点请求"的指纹。300 req/s × 30ms 抖动 = +9s/周期，可接受。
+DEFAULT_JITTER_MS = 30
+
+# 限流检测后的惩罚性 jitter 区间（毫秒）。当 p95 延迟超阈值时启用。
+JITTER_PENALTY_MIN_MS = 200
+JITTER_PENALTY_MAX_MS = 600
+
+# p95 延迟阈值：超过即认为被限流
+P95_LATENCY_THRESHOLD_S = 1.5
+
+# 滑动窗口大小（最近 N 次请求的延迟）
+LATENCY_WINDOW_SIZE = 100
+
+
+class _LatencyTracker:
+    """滑动窗口：跟踪最近 N 次请求延迟，用于自适应 jitter + 限流检测。"""
+
+    def __init__(self, window: int = LATENCY_WINDOW_SIZE):
+        self._samples: Deque[float] = deque(maxlen=window)
+
+    def add(self, lat: float) -> None:
+        self._samples.append(lat)
+
+    def p95(self) -> float:
+        if len(self._samples) < 10:
+            return 0.0
+        s = sorted(self._samples)
+        idx = max(0, int(len(s) * 0.95) - 1)
+        return s[idx]
 
 
 # ---------- 标准化数据模型 ----------
@@ -82,11 +118,21 @@ class BaseFetcher(ABC):
 
     name: str = "base"
 
-    def __init__(self, concurrency: int = 8, timeout: float = 10.0):
+    def __init__(
+        self,
+        concurrency: int = 8,
+        timeout: float = 10.0,
+        jitter_ms: int = DEFAULT_JITTER_MS,
+        retry_max: int = 1,
+    ):
         self.concurrency = concurrency
         self.timeout = timeout
+        self.jitter_ms = jitter_ms
+        self.retry_max = retry_max
         self._session: aiohttp.ClientSession | None = None
         self._sem: asyncio.Semaphore | None = None
+        self._lat_tracker = _LatencyTracker()
+        self._throttle_state: str = "normal"  # "normal" | "throttled"
 
     async def __aenter__(self) -> BaseFetcher:
         await self.start()
@@ -104,12 +150,105 @@ class BaseFetcher(ABC):
             },
         )
         self._sem = asyncio.Semaphore(self.concurrency)
+        self._lat_tracker = _LatencyTracker()
+        self._throttle_state = "normal"
 
     async def close(self) -> None:
         if self._session:
             await self._session.close()
             self._session = None
             self._sem = None
+
+    async def _polite_get(self, url: str, **kwargs: Any) -> aiohttp.ClientResponse:
+        """HTTP GET 加 jitter + retry + 限流自适应。
+
+        - 正常态：每次请求前加 0~jitter_ms 随机延迟（打破齐刷刷时序）
+        - 限流态：p95 延迟 > 阈值时切到 200-600ms 大 jitter；p95 恢复后切回
+        - 5xx / 连接错误：最多重试 retry_max 次（指数退避 + 随机）
+        - 每次请求延迟进滑动窗口，用于 p95 计算
+
+        返回 ClientResponse；调用方用 `async with await self._polite_get(...) as resp:`。
+        持续失败时抛出最后一次异常。
+        """
+        if self._session is None:
+            raise RuntimeError("Fetcher not started")
+
+        last_exc: Exception | None = None
+        for attempt in range(self.retry_max + 1):
+            # 1) 自适应 jitter
+            if self._throttle_state == "throttled":
+                jmin, jmax = JITTER_PENALTY_MIN_MS, JITTER_PENALTY_MAX_MS
+            else:
+                jmin = 0
+                jmax = self.jitter_ms
+            if jmax > 0:
+                await asyncio.sleep(random.uniform(jmin, jmax) / 1000.0)
+
+            # 2) 真正发请求
+            t0 = time.time()
+            try:
+                resp = await self._session.get(url, **kwargs)
+                latency = time.time() - t0
+                self._lat_tracker.add(latency)
+
+                # 3) 5xx 视为可重试
+                if resp.status >= 500 and attempt < self.retry_max:
+                    logger.debug(
+                        "%s: HTTP %d for %s, retry %d/%d",
+                        self.name, resp.status, url[:80], attempt + 1, self.retry_max,
+                    )
+                    resp.release()
+                    await asyncio.sleep(0.5 * (attempt + 1) + random.uniform(0, 0.2))
+                    continue
+                if resp.status >= 500:
+                    # 重试次数用完，让上层处理
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history,
+                        status=resp.status, message=f"HTTP {resp.status}",
+                    )
+
+                # 4) 限流状态机：p95 漂移检测
+                p95 = self._lat_tracker.p95()
+                if p95 > P95_LATENCY_THRESHOLD_S and self._throttle_state == "normal":
+                    self._throttle_state = "throttled"
+                    logger.warning(
+                        "%s: THROTTLE detected — p95 latency %.2fs > %.1fs threshold, "
+                        "switching to penalty jitter (%d-%dms). "
+                        "If this persists, consider lowering concurrency or "
+                        "decoupling orderbook fetch.",
+                        self.name, p95, P95_LATENCY_THRESHOLD_S,
+                        JITTER_PENALTY_MIN_MS, JITTER_PENALTY_MAX_MS,
+                    )
+                elif (
+                    p95 < P95_LATENCY_THRESHOLD_S * 0.5
+                    and self._throttle_state == "throttled"
+                ):
+                    self._throttle_state = "normal"
+                    logger.info(
+                        "%s: throttle cleared — p95=%.2fs, resuming normal jitter",
+                        self.name, p95,
+                    )
+
+                return resp
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                latency = time.time() - t0
+                self._lat_tracker.add(latency)
+                last_exc = exc
+                if attempt < self.retry_max:
+                    logger.debug(
+                        "%s: %s for %s, retry %d/%d",
+                        self.name, type(exc).__name__, url[:80],
+                        attempt + 1, self.retry_max,
+                    )
+                    await asyncio.sleep(0.5 * (attempt + 1) + random.uniform(0, 0.2))
+                    continue
+                raise
+
+        # 理论上不会到这里（最后一次 attempt 不 continue），但兜底
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("_polite_get: unexpected exit")
 
     @abstractmethod
     async def fetch(self, inst: Instrument) -> Quote | None:
@@ -177,7 +316,7 @@ class EastmoneyFetcher(BaseFetcher):
         url = f"{self._BASE_URL}?secid={inst.secid}&fields={fields}"
         async with self._sem:
             try:
-                async with self._session.get(url) as resp:
+                async with await self._polite_get(url) as resp:
                     resp.raise_for_status()
                     payload = await resp.json(content_type=None)
             except Exception as exc:
@@ -313,7 +452,7 @@ class EastmoneyFetcher(BaseFetcher):
             url = f"https://qt.gtimg.cn/q={syms}"
             try:
                 async with sem:
-                    async with self._session.get(url) as resp:
+                    async with await self._polite_get(url) as resp:
                         text = await resp.text(encoding="gbk")
             except Exception as exc:
                 logger.debug("Tencent orderbook fetch failed: %s", exc)
@@ -397,7 +536,7 @@ class SinaFetcher(BaseFetcher):
             url = self._BASE_URL.format(symbols=symbols)
             try:
                 # 新浪要求 Referer
-                async with self._session.get(
+                async with await self._polite_get(
                     url,
                     headers={"Referer": "https://finance.sina.com.cn/"},
                 ) as resp:
@@ -527,7 +666,7 @@ class TencentFetcher(BaseFetcher):
             symbols = ",".join(i.tencent_symbol for i in chunk)
             url = self._BASE_URL.format(symbols=symbols)
             try:
-                async with self._session.get(url) as resp:
+                async with await self._polite_get(url) as resp:
                     resp.raise_for_status()
                     text = await resp.text(encoding="gbk")
             except Exception as exc:
@@ -642,10 +781,16 @@ async def fetch_with_fallback(
     instruments: list[Instrument],
     sources: list[str],
     concurrency: int = 8,
+    jitter_ms: int = DEFAULT_JITTER_MS,
+    retry_max: int = 1,
 ) -> list[Quote]:
     """按顺序尝试数据源，主源失败率 > 30% 自动降级到下一源。
 
     特殊处理：当主源是 eastmoney 时，会额外从腾讯补全盘口五档（实现数据完整）。
+
+    反爬参数：
+    - jitter_ms: 每请求前的随机延迟上限（毫秒）。打破齐刷刷时序。
+    - retry_max: 5xx/连接错误的最大重试次数。
     """
     last_results: list[Quote] = []
     for src_name in sources:
@@ -656,7 +801,11 @@ async def fetch_with_fallback(
         logger.info("Trying source: %s (%d instruments)", src_name, len(instruments))
         t0 = time.time()
         try:
-            async with cls(concurrency=concurrency) as fetcher:
+            async with cls(
+                concurrency=concurrency,
+                jitter_ms=jitter_ms,
+                retry_max=retry_max,
+            ) as fetcher:
                 # 东方财富走扩展版（自动补盘口）
                 if src_name == "eastmoney" and hasattr(fetcher, "fetch_batch_with_orderbook"):
                     results = await fetcher.fetch_batch_with_orderbook(instruments)

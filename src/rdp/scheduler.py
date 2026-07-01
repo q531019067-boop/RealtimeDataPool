@@ -54,6 +54,8 @@ class Scheduler:
         fetch_out_of_session: bool = False,
         sources: list[str] | None = None,
         concurrency: int = 8,
+        jitter_ms: int = 30,
+        retry_max: int = 1,
     ):
         self.pool = pool
         self.storage = storage
@@ -61,6 +63,8 @@ class Scheduler:
         self.fetch_out_of_session = fetch_out_of_session
         self.sources = sources or ["eastmoney", "sina", "tencent"]
         self.concurrency = concurrency
+        self.jitter_ms = jitter_ms
+        self.retry_max = retry_max
 
         self._running = False
         self._task: asyncio.Task[None] | None = None
@@ -89,7 +93,10 @@ class Scheduler:
         fetch_t0 = time.time()
         try:
             quotes = await fetch_with_fallback(
-                instruments, self.sources, concurrency=self.concurrency
+                instruments, self.sources,
+                concurrency=self.concurrency,
+                jitter_ms=self.jitter_ms,
+                retry_max=self.retry_max,
             )
         except Exception as exc:
             self.storage.finish_fetch_run(

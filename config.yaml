@@ -22,3 +22,11 @@ api:
 logging:
   level: INFO
   file: logs/rdp.log
+
+# 反爬 / 礼貌请求参数
+# jitter_ms: 每请求前随机 0~N ms 延迟。打破"齐刷刷整点请求"指纹。
+#   0 = 关闭；30 = 轻度（约 +9s/周期开销）；50 = 中度；>100 不推荐。
+# retry_max: 5xx/连接错误的最大重试次数。
+fetcher:
+  jitter_ms: 30
+  retry_max: 1

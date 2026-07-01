@@ -72,6 +72,8 @@ async def _serve(cfg: dict, host: str, port: int) -> None:
         fetch_out_of_session=cfg["pool"]["fetch_out_of_session"],
         sources=cfg["pool"]["sources"],
         concurrency=cfg["pool"]["concurrency_per_source"],
+        jitter_ms=cfg.get("fetcher", {}).get("jitter_ms", 30),
+        retry_max=cfg.get("fetcher", {}).get("retry_max", 1),
     )
 
     app = create_app(storage, sched)
