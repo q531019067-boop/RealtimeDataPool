@@ -670,16 +670,28 @@ async def fetch_with_fallback(
         success = len(results)
         valid = sum(1 for q in results if q.price is not None)
         with_ob = sum(1 for q in results if q.bid_prices and q.bid_prices[0] is not None)
+        valid_pct = valid / max(success, 1) * 100
         logger.info(
-            "Source %s: %d/%d returned (valid=%d, with_orderbook=%d) in %.1fs",
-            src_name, success, len(instruments), valid, with_ob, elapsed,
+            "Source %s: %d/%d returned (valid=%d/%.1f%%, with_orderbook=%d) in %.1fs",
+            src_name, success, len(instruments), valid, valid_pct, with_ob, elapsed,
         )
 
         if valid / max(success, 1) >= 0.7 or not last_results:
             last_results = results
             if valid > 0:
                 return results
+            else:
+                logger.warning(
+                    "Source %s returned ZERO valid quotes — trying next source",
+                    src_name,
+                )
         else:
+            # 显式标记降级原因
+            logger.warning(
+                "Source %s DEGRADED: valid=%d/%d (%.1f%% < 70%%) "
+                "— falling back to next source",
+                src_name, valid, success, valid_pct,
+            )
             last_results = results
 
     return last_results

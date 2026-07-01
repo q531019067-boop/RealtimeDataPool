@@ -87,14 +87,23 @@ async def _serve(cfg: dict, host: str, port: int) -> None:
     server_task = asyncio.create_task(server.serve())
 
     logger = logging.getLogger("rdp")
+    logger.info("=" * 60)
     logger.info(
-        "RDP started: %d codes, %ds interval, sources=%s, API=http://%s:%d",
-        len(pool), sched.fetch_interval_sec, sched.sources, host, port,
+        "RDP started: pool=%d codes, interval=%ds, sources=%s, "
+        "fetch_out_of_session=%s",
+        len(pool), sched.fetch_interval_sec, sched.sources,
+        cfg["pool"]["fetch_out_of_session"],
+    )
+    logger.info(
+        "API:    http://%s:%d  |  DB: %s  |  log: %s",
+        host, port, cfg["storage"]["db_path"],
+        ROOT / cfg["logging"]["file"],
     )
     logger.info(
         "Trading session: %s",
-        "YES" if is_trading_session() else "NO (fetching will skip)",
+        "ACTIVE" if is_trading_session() else "INACTIVE (will skip unless fetch_out_of_session)",
     )
+    logger.info("=" * 60)
 
     try:
         await asyncio.gather(sched_task, server_task)
