@@ -379,7 +379,7 @@ class EastmoneyFetcher(BaseFetcher):
             pb=_num("f167"),
             market_cap=_num("f116"),
             float_cap=_num("f117"),
-            # 盘口五档由腾讯补全
+            # 盘口五档由 TencentFetcher.fetch_orderbook_batch 单独补全
             bid_prices=[None] * 5,
             bid_vols=[None] * 5,
             ask_prices=[None] * 5,
@@ -388,114 +388,6 @@ class EastmoneyFetcher(BaseFetcher):
             fetched_at=time.time(),
             source=self.name,
         )
-
-    async def fetch_with_orderbook(self, inst: Instrument) -> Quote | None:
-        """扩展版：抓基础行情后，并行从腾讯补盘口五档。"""
-        # 1. 拿基础行情
-        quote = await self.fetch(inst)
-        if quote is None or quote.is_stale:
-            return quote
-        # 2. 平行从腾讯补盘口（用极简字段，1 只 1 次请求）
-        ob = await self._fetch_tencent_orderbook(inst)
-        if ob is not None:
-            quote.bid_prices = ob["bid_prices"]
-            quote.bid_vols = ob["bid_vols"]
-            quote.ask_prices = ob["ask_prices"]
-            quote.ask_vols = ob["ask_vols"]
-        return quote
-
-    async def fetch_batch_with_orderbook(
-        self, instruments: list[Instrument]
-    ) -> list[Quote]:
-        """扩展版批量抓取：基础行情 + 盘口补全。
-
-        策略：先并发拉东方财富拿到基础行情，再并发从腾讯补盘口。
-        """
-        # Step 1: 批量抓基础行情
-        basic_results = await self.fetch_batch(instruments)
-        # Step 2: 对有效 quote 并行补盘口
-        valid_codes = [q.code for q in basic_results if q and not q.is_stale]
-        tencent_map = await self._fetch_tencent_orderbook_batch(instruments, valid_codes)
-        for q in basic_results:
-            ob = tencent_map.get(q.code)
-            if ob:
-                q.bid_prices = ob["bid_prices"]
-                q.bid_vols = ob["bid_vols"]
-                q.ask_prices = ob["ask_prices"]
-                q.ask_vols = ob["ask_vols"]
-        return basic_results
-
-    async def _fetch_tencent_orderbook(self, inst: Instrument) -> dict | None:
-        """单只从腾讯拿盘口。"""
-        results = await self._fetch_tencent_orderbook_batch([inst], [inst.code])
-        return results.get(inst.code)
-
-    async def _fetch_tencent_orderbook_batch(
-        self, all_instruments: list[Instrument], codes: list[str]
-    ) -> dict[str, dict]:
-        """批量从腾讯拿盘口（每批 60 只）。"""
-        if not codes:
-            return {}
-        # 构建 code -> inst 映射
-        code_to_inst = {i.code: i for i in all_instruments}
-        out: dict[str, dict] = {}
-        # 分批
-        BATCH = 60
-        code_list = list(codes)
-        sem = asyncio.Semaphore(self.concurrency)
-        async def _one(chunk_codes: list[str]) -> None:
-            if self._session is None:
-                return
-            syms = ",".join(f"{code_to_inst[c].tencent_symbol}" for c in chunk_codes if c in code_to_inst)
-            if not syms:
-                return
-            url = f"https://qt.gtimg.cn/q={syms}"
-            try:
-                async with sem:
-                    async with await self._polite_get(url) as resp:
-                        text = await resp.text(encoding="gbk")
-            except Exception as exc:
-                logger.debug("Tencent orderbook fetch failed: %s", exc)
-                return
-            for line in text.strip().splitlines():
-                if "=" not in line or '"' not in line:
-                    continue
-                try:
-                    var_part, val_part = line.split("=", 1)
-                    sym = var_part.strip().split("_")[-1]
-                    val = val_part.strip().strip(";").strip('"')
-                    if not val:
-                        continue
-                    fields = val.split("~")
-                    # 找 code
-                    inst_code = None
-                    for c in chunk_codes:
-                        if code_to_inst.get(c) and code_to_inst[c].tencent_symbol == sym:
-                            inst_code = c
-                            break
-                    if inst_code is None or len(fields) < 50:
-                        continue
-                    bid_prices = []
-                    bid_vols = []
-                    ask_prices = []
-                    ask_vols = []
-                    for i in range(5):
-                        bid_prices.append(_to_float(fields[9 + i * 2]))
-                        bid_vols.append(_to_float(fields[10 + i * 2]))
-                        ask_prices.append(_to_float(fields[19 + i * 2]))
-                        ask_vols.append(_to_float(fields[20 + i * 2]))
-                    out[inst_code] = {
-                        "bid_prices": bid_prices,
-                        "bid_vols": bid_vols,
-                        "ask_prices": ask_prices,
-                        "ask_vols": ask_vols,
-                    }
-                except Exception as exc:
-                    logger.debug("Tencent parse error: %s", exc)
-
-        chunks = [code_list[i:i + BATCH] for i in range(0, len(code_list), BATCH)]
-        await asyncio.gather(*[_one(c) for c in chunks])
-        return out
 
 
 def _to_float(v: str) -> float | None:
@@ -693,6 +585,59 @@ class TencentFetcher(BaseFetcher):
                     logger.debug("Tencent parse error for %r: %s", line[:80], exc)
         return out
 
+    async def fetch_orderbook_batch(
+        self, instruments: list[Instrument]
+    ) -> dict[str, dict]:
+        """批量从腾讯拿盘口五档（每批 60 只）。
+
+        返回 {code: {"bid_prices": [...], "bid_vols": [...], "ask_prices": [...], "ask_vols": [...]}}。
+
+        设计目的：与基础行情 fetch 解耦，由 Scheduler 独立周期调用，
+        避免每 30s 拉 5500+ 盘口请求触发服务端限流。
+        """
+        if self._session is None:
+            raise RuntimeError("Fetcher not started")
+        if not instruments:
+            return {}
+        out: dict[str, dict] = {}
+        for chunk in _chunks(instruments, self._BATCH_SIZE):
+            symbols = ",".join(i.tencent_symbol for i in chunk)
+            url = self._BASE_URL.format(symbols=symbols)
+            try:
+                async with await self._polite_get(url) as resp:
+                    resp.raise_for_status()
+                    text = await resp.text(encoding="gbk")
+            except Exception as exc:
+                logger.debug("Tencent orderbook batch failed: %s", exc)
+                continue
+
+            for line in text.strip().splitlines():
+                if "=" not in line or '"' not in line:
+                    continue
+                try:
+                    var_part, val_part = line.split("=", 1)
+                    sym = var_part.strip().split("_")[-1]
+                    val = val_part.strip().strip(";").strip('"')
+                    if not val:
+                        continue
+                    fields = val.split("~")
+                    inst = _find_inst(chunk, sym)
+                    if inst is None or len(fields) < 50:
+                        continue
+                    bid_prices = [_to_float(fields[9 + i * 2]) for i in range(5)]
+                    bid_vols = [_to_float(fields[10 + i * 2]) for i in range(5)]
+                    ask_prices = [_to_float(fields[19 + i * 2]) for i in range(5)]
+                    ask_vols = [_to_float(fields[20 + i * 2]) for i in range(5)]
+                    out[inst.code] = {
+                        "bid_prices": bid_prices,
+                        "bid_vols": bid_vols,
+                        "ask_prices": ask_prices,
+                        "ask_vols": ask_vols,
+                    }
+                except Exception as exc:
+                    logger.debug("Tencent orderbook parse error: %s", exc)
+        return out
+
 
 def _parse_tencent(inst: Instrument, fields: list[str]) -> Quote | None:
     """腾讯字段（数组位置 → 含义，已实测 2026-06）：
@@ -786,7 +731,8 @@ async def fetch_with_fallback(
 ) -> list[Quote]:
     """按顺序尝试数据源，主源失败率 > 30% 自动降级到下一源。
 
-    特殊处理：当主源是 eastmoney 时，会额外从腾讯补全盘口五档（实现数据完整）。
+    只抓基础行情，盘口五档由 Scheduler 通过 TencentFetcher.fetch_orderbook_batch
+    在独立周期（默认 5min）单独补全。
 
     反爬参数：
     - jitter_ms: 每请求前的随机延迟上限（毫秒）。打破齐刷刷时序。
@@ -806,11 +752,7 @@ async def fetch_with_fallback(
                 jitter_ms=jitter_ms,
                 retry_max=retry_max,
             ) as fetcher:
-                # 东方财富走扩展版（自动补盘口）
-                if src_name == "eastmoney" and hasattr(fetcher, "fetch_batch_with_orderbook"):
-                    results = await fetcher.fetch_batch_with_orderbook(instruments)
-                else:
-                    results = await fetcher.fetch_batch(instruments)
+                results = await fetcher.fetch_batch(instruments)
         except Exception as exc:
             logger.error("Source %s crashed: %s", src_name, exc)
             continue

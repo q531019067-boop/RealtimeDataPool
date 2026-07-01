@@ -107,6 +107,7 @@ class Storage:
         """写连接：长连接 + WAL，便于高频插入。"""
         if self._conn is None:
             self._conn = sqlite3.connect(self.db_path, timeout=30.0)
+            self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
         try:
@@ -182,6 +183,42 @@ class Storage:
 
     def insert_snapshot(self, quote: Quote) -> None:
         self.insert_snapshots([quote])
+
+    def update_snapshot_orderbook(
+        self,
+        code: str,
+        bid_prices: list[float | None],
+        bid_vols: list[float | None],
+        ask_prices: list[float | None],
+        ask_vols: list[float | None],
+        orderbook_fetched_at: float,
+    ) -> bool:
+        """把盘口五档 in-place 写回该 code 的最新 snapshot。
+
+        用于"盘口补全解耦"流程：基础行情每 30s 写一次，盘口每 5min 单独补一次，
+        复用最新 snapshot 的 data_json，只覆盖 4 个盘口字段 + 新增 orderbook_fetched_at。
+
+        返回 True 表示更新成功，False 表示找不到该 code 的 snapshot。
+        """
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT id, data_json FROM snapshots WHERE code=? "
+                "ORDER BY fetched_at DESC LIMIT 1",
+                (code,),
+            ).fetchone()
+            if not row:
+                return False
+            data = json.loads(row["data_json"])
+            data["bid_prices"] = bid_prices
+            data["bid_vols"] = bid_vols
+            data["ask_prices"] = ask_prices
+            data["ask_vols"] = ask_vols
+            data["orderbook_fetched_at"] = orderbook_fetched_at
+            conn.execute(
+                "UPDATE snapshots SET data_json=? WHERE id=?",
+                (json.dumps(data, ensure_ascii=False), row["id"]),
+            )
+        return True
 
     def query_latest(self, codes: list[str] | None = None) -> list[dict[str, Any]]:
         """查指定代码的最新快照。

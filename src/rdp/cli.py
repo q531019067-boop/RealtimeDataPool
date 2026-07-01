@@ -69,6 +69,7 @@ async def _serve(cfg: dict, host: str, port: int) -> None:
         pool,
         storage,
         fetch_interval_sec=cfg["pool"]["fetch_interval_sec"],
+        orderbook_interval_sec=cfg["pool"].get("orderbook_interval_sec", 300),
         fetch_out_of_session=cfg["pool"]["fetch_out_of_session"],
         sources=cfg["pool"]["sources"],
         concurrency=cfg["pool"]["concurrency_per_source"],
@@ -91,10 +92,10 @@ async def _serve(cfg: dict, host: str, port: int) -> None:
     logger = logging.getLogger("rdp")
     logger.info("=" * 60)
     logger.info(
-        "RDP started: pool=%d codes, interval=%ds, sources=%s, "
-        "fetch_out_of_session=%s",
-        len(pool), sched.fetch_interval_sec, sched.sources,
-        cfg["pool"]["fetch_out_of_session"],
+        "RDP started: pool=%d codes, basic_interval=%ds, orderbook_interval=%ds, "
+        "sources=%s, fetch_out_of_session=%s",
+        len(pool), sched.fetch_interval_sec, sched.orderbook_interval_sec,
+        sched.sources, cfg["pool"]["fetch_out_of_session"],
     )
     logger.info(
         "API:    http://%s:%d  |  DB: %s  |  log: %s",

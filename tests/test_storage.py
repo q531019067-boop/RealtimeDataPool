@@ -79,3 +79,70 @@ class TestStorage:
         assert storage.get_meta("version") == "0.1.0"
         storage.set_meta("version", "0.2.0")
         assert storage.get_meta("version") == "0.2.0"
+
+    def test_update_snapshot_orderbook_writes_in_place(self, storage: Storage):
+        """盘口补全：插入一条无盘口的 snapshot，update 后盘口字段被覆盖、orderbook_fetched_at 写入。"""
+        storage.upsert_instruments([Instrument(code="000001", name="平安", market="sz")])
+        # basic snapshot（无盘口）
+        storage.insert_snapshot(Quote(
+            code="000001", name="平安", market="sz",
+            price=10.5, change_pct=1.5,
+            source="eastmoney", fetched_at=1000.0,
+            bid_prices=[None] * 5, bid_vols=[None] * 5,
+            ask_prices=[None] * 5, ask_vols=[None] * 5,
+        ))
+        # 补盘口
+        ok = storage.update_snapshot_orderbook(
+            "000001",
+            bid_prices=[10.49, 10.48, 10.47, 10.46, 10.45],
+            bid_vols=[100, 200, 300, 400, 500],
+            ask_prices=[10.51, 10.52, 10.53, 10.54, 10.55],
+            ask_vols=[150, 250, 350, 450, 550],
+            orderbook_fetched_at=2000.0,
+        )
+        assert ok is True
+        rows = storage.query_latest(["000001"])
+        assert len(rows) == 1
+        # 基本字段未变
+        assert rows[0]["price"] == 10.5
+        assert rows[0]["change_pct"] == 1.5
+        # 盘口字段被覆盖
+        assert rows[0]["bid_prices"][0] == 10.49
+        assert rows[0]["bid_vols"][4] == 500
+        assert rows[0]["ask_prices"][3] == 10.54
+        assert rows[0]["ask_vols"][2] == 350
+        # 新增字段
+        assert rows[0]["orderbook_fetched_at"] == 2000.0
+
+    def test_update_snapshot_orderbook_missing_code(self, storage: Storage):
+        """对不存在的 code 返回 False，不报错。"""
+        ok = storage.update_snapshot_orderbook(
+            "999999",
+            [None] * 5, [None] * 5, [None] * 5, [None] * 5,
+            orderbook_fetched_at=1.0,
+        )
+        assert ok is False
+
+    def test_update_snapshot_orderbook_only_latest(self, storage: Storage):
+        """盘口更新只影响最新 snapshot，不动历史。"""
+        storage.upsert_instruments([Instrument(code="000001", name="x", market="sz")])
+        for ts in [1000.0, 2000.0, 3000.0]:
+            storage.insert_snapshot(Quote(
+                code="000001", name="x", market="sz", price=ts,
+                fetched_at=ts, source="eastmoney",
+            ))
+        storage.update_snapshot_orderbook(
+            "000001",
+            [99.0] + [None] * 4, [None] * 5, [None] * 5, [None] * 5,
+            orderbook_fetched_at=4000.0,
+        )
+        # 最新 snapshot（3000）应有盘口
+        latest = storage.query_latest(["000001"])
+        assert latest[0]["bid_prices"][0] == 99.0
+        # 历史 snapshot 不应有盘口
+        hist = storage.query_history("000001", limit=10)
+        for row in hist:
+            if row["fetched_at"] < 3000.0:
+                assert row["bid_prices"][0] is None
+            else:
+                assert row["bid_prices"][0] == 99.0

@@ -1,5 +1,6 @@
 pool:
   fetch_interval_sec: 30
+  orderbook_interval_sec: 300   # 盘口补全间隔（5min）。与基础行情解耦，削减 90%+ 腾讯请求
   fetch_out_of_session: true
   concurrency_per_source: 8
   sources:
