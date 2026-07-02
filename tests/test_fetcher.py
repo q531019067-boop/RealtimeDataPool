@@ -2,7 +2,7 @@
 
 import pytest
 
-from rdp.fetcher import _parse_sina, _parse_tencent
+from rdp.fetcher import Quote, _parse_sina, _parse_tencent, fetch_with_fallback
 from rdp.instruments import Instrument
 
 
@@ -210,3 +210,71 @@ class TestFetchWithFallbackSignature:
         ret = sig.return_annotation
         # 现在是 tuple[list[Quote], str | None]
         assert "tuple" in str(ret).lower() or "Tuple" in str(ret)
+
+
+class TestFetchWithFallbackCoverage:
+    @pytest.mark.asyncio
+    async def test_partial_primary_falls_back_using_pool_coverage(self, monkeypatch):
+        instruments = [
+            Instrument(code=f"{i:06d}", name=str(i), market="sz") for i in range(10)
+        ]
+
+        class PartialFetcher:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def fetch_batch(self, requested):
+                return [Quote(code=requested[0].code, price=1.0)]
+
+        class HealthyFetcher(PartialFetcher):
+            async def fetch_batch(self, requested):
+                return [Quote(code=i.code, price=1.0) for i in requested]
+
+        monkeypatch.setitem(__import__("rdp.fetcher", fromlist=["FETCHER_REGISTRY"]).FETCHER_REGISTRY,
+                            "partial-test", PartialFetcher)
+        monkeypatch.setitem(__import__("rdp.fetcher", fromlist=["FETCHER_REGISTRY"]).FETCHER_REGISTRY,
+                            "healthy-test", HealthyFetcher)
+
+        quotes, source = await fetch_with_fallback(
+            instruments, ["partial-test", "healthy-test"], jitter_ms=0
+        )
+        assert source == "healthy-test"
+        assert len(quotes) == len(instruments)
+
+    @pytest.mark.asyncio
+    async def test_returns_best_source_when_all_are_degraded(self, monkeypatch):
+        instruments = [
+            Instrument(code=f"{i:06d}", name=str(i), market="sz") for i in range(10)
+        ]
+
+        def fetcher_with_count(count):
+            class StubFetcher:
+                def __init__(self, **kwargs):
+                    pass
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    return None
+
+                async def fetch_batch(self, requested):
+                    return [Quote(code=i.code, price=1.0) for i in requested[:count]]
+
+            return StubFetcher
+
+        registry = __import__("rdp.fetcher", fromlist=["FETCHER_REGISTRY"]).FETCHER_REGISTRY
+        monkeypatch.setitem(registry, "better-test", fetcher_with_count(6))
+        monkeypatch.setitem(registry, "worse-test", fetcher_with_count(2))
+
+        quotes, source = await fetch_with_fallback(
+            instruments, ["better-test", "worse-test"], jitter_ms=0
+        )
+        assert source == "better-test"
+        assert len(quotes) == 6

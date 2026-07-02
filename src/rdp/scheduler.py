@@ -55,6 +55,7 @@ class Scheduler:
         fetch_interval_sec: int = 30,
         orderbook_interval_sec: int = 300,
         cleanup_interval_sec: int = 1800,  # P2: 30min 一次
+        retention_days: int = 7,
         fetch_out_of_session: bool = False,
         sources: list[str] | None = None,
         concurrency: int = 8,
@@ -66,6 +67,7 @@ class Scheduler:
         self.fetch_interval_sec = fetch_interval_sec
         self.orderbook_interval_sec = orderbook_interval_sec
         self.cleanup_interval_sec = cleanup_interval_sec
+        self.retention_days = retention_days
         self.fetch_out_of_session = fetch_out_of_session
         self.sources = sources or ["eastmoney", "sina", "tencent"]
         self.concurrency = concurrency
@@ -230,6 +232,9 @@ class Scheduler:
         相比原来每 30s 一次，腾讯请求量从 ~11000/min 降到 ~1100/min。
         """
         t0 = time.time()
+        # 记录尝试时间而不只是成功时间。失败/no-target 时也按正常周期重试，
+        # 避免每个 basic tick（30s）持续冲击腾讯接口。
+        self._last_orderbook_at = t0
         # 从 DB 拉最新 snapshot，决定要给哪些 code 补盘口
         latest_quotes = self.storage.query_latest()
         targets = [
@@ -330,6 +335,9 @@ class Scheduler:
         except Exception:
             logger.exception("Warm-up orderbook fetch failed")
 
+        # warm-up 已经完成一个完整周期；先等待一个 basic interval，避免启动时双抓。
+        await asyncio.sleep(self.fetch_interval_sec)
+
         # 之后进入双节拍轮询
         while self._running:
             in_session = is_trading_session()
@@ -366,7 +374,8 @@ class Scheduler:
                 logger.debug("Outside trading session, skipping basic")
 
             # ---- orderbook phase（独立节拍）----
-            if self._last_orderbook_at == 0.0 or (
+            if (self.fetch_out_of_session or in_session) and (
+                self._last_orderbook_at == 0.0 or
                 time.time() - self._last_orderbook_at >= self.orderbook_interval_sec
             ):
                 try:
@@ -380,7 +389,7 @@ class Scheduler:
                 or time.time() - self._last_cleanup_at >= self.cleanup_interval_sec
             ):
                 try:
-                    self.storage.cleanup_old_snapshots(retention_days=7)
+                    self.storage.cleanup_old_snapshots(retention_days=self.retention_days)
                     self._last_cleanup_at = time.time()
                 except Exception:
                     logger.exception("Cleanup failed")

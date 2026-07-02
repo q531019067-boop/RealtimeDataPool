@@ -326,17 +326,36 @@ class BaseFetcher(ABC):
                 latency = time.time() - t0
                 self._lat_tracker.add(latency)
 
-                # 3) 5xx 视为可重试
-                if resp.status >= 500 and attempt < self.retry_max:
+                # 3) 429 / 5xx 视为可重试。429 是明确限流信号，立即降并发，
+                # 并优先尊重服务端 Retry-After，避免固定频率继续撞限流窗口。
+                retryable_status = resp.status == 429 or resp.status >= 500
+                if resp.status == 429:
+                    self._throttle_state = "throttled"
+                    old_cap = self._limiter.current
+                    new_cap = max(CONCURRENCY_FLOOR, old_cap // 2)
+                    if new_cap < old_cap:
+                        self._limiter.adjust(new_cap)
+                        logger.warning(
+                            "%s: HTTP 429 — concurrency %d→%d and penalty jitter enabled",
+                            self.name, old_cap, new_cap,
+                        )
+                if retryable_status and attempt < self.retry_max:
                     logger.debug(
                         "%s: HTTP %d for %s, retry %d/%d",
                         self.name, resp.status, url[:80], attempt + 1, self.retry_max,
                     )
+                    retry_after = resp.headers.get("Retry-After")
                     resp.release()
-                    await asyncio.sleep(0.5 * (attempt + 1) + random.uniform(0, 0.2))
+                    try:
+                        server_delay = min(30.0, max(0.0, float(retry_after or 0)))
+                    except ValueError:
+                        server_delay = 0.0
+                    backoff = 0.5 * (2 ** attempt) + random.uniform(0, 0.3)
+                    await asyncio.sleep(max(server_delay, backoff))
                     continue
-                if resp.status >= 500:
+                if retryable_status:
                     # 重试次数用完，让上层处理
+                    resp.release()
                     raise aiohttp.ClientResponseError(
                         resp.request_info, resp.history,
                         status=resp.status, message=f"HTTP {resp.status}",
@@ -405,6 +424,21 @@ class BaseFetcher(ABC):
                         )
                     self._req_since_restore = 0
 
+                # p95 可能在 restore 冷却期结束前已经恢复。状态已回 normal 后，
+                # 到达冷却请求数仍要恢复初始并发，否则会永久停留在降级 cap。
+                if (
+                    self._throttle_state == "normal"
+                    and self._limiter.current < self._limiter.initial
+                    and self._req_since_restore >= CONCURRENCY_RESTORE_COOLDOWN
+                ):
+                    old_cap = self._limiter.current
+                    self._limiter.reset()
+                    self._req_since_restore = 0
+                    logger.info(
+                        "%s: stable recovery — concurrency restored %d→%d",
+                        self.name, old_cap, self._limiter.current,
+                    )
+
                 return resp
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
@@ -417,7 +451,7 @@ class BaseFetcher(ABC):
                         self.name, type(exc).__name__, url[:80],
                         attempt + 1, self.retry_max,
                     )
-                    await asyncio.sleep(0.5 * (attempt + 1) + random.uniform(0, 0.2))
+                    await asyncio.sleep(0.5 * (2 ** attempt) + random.uniform(0, 0.3))
                     continue
                 raise
 
@@ -993,30 +1027,30 @@ async def fetch_with_fallback(
         success = len(results)
         valid = sum(1 for q in results if q.price is not None)
         with_ob = sum(1 for q in results if q.bid_prices and q.bid_prices[0] is not None)
-        valid_pct = valid / max(success, 1) * 100
+        # 降级必须按整个目标池计算覆盖率。若按 success 作分母，主源只返回
+        # 1 条且有效时会被误判为 100% 健康，永远不会进入备用源。
+        valid_coverage = valid / max(len(instruments), 1)
+        valid_pct = valid_coverage * 100
         logger.info(
             "Source %s: %d/%d returned (valid=%d/%.1f%%, with_orderbook=%d) in %.1fs",
             src_name, success, len(instruments), valid, valid_pct, with_ob, elapsed,
         )
 
-        if valid / max(success, 1) >= 0.7 or not last_results:
+        if valid_coverage >= 0.7:
             last_results = results
             last_source = src_name
-            if valid > 0:
-                return results, src_name
-            else:
-                logger.warning(
-                    "Source %s returned ZERO valid quotes — trying next source",
-                    src_name,
-                )
+            return results, src_name
         else:
             # 显式标记降级原因
             logger.warning(
                 "Source %s DEGRADED: valid=%d/%d (%.1f%% < 70%%) "
                 "— falling back to next source",
-                src_name, valid, success, valid_pct,
+                src_name, valid, len(instruments), valid_pct,
             )
-            last_results = results
-            last_source = src_name
+            # 全部源都不达标时，保留有效覆盖最多的一组，而不是无条件返回最后一源。
+            previous_valid = sum(1 for q in last_results if q.price is not None)
+            if valid > previous_valid:
+                last_results = results
+                last_source = src_name
 
     return last_results, last_source

@@ -55,6 +55,8 @@ class _RateLimitMiddleware(BaseHTTPMiddleware):
 
     def _check(self, ip: str) -> tuple[bool, int]:
         """返回 (allowed, retry_after_sec)."""
+        if self.limit <= 0:
+            return True, 0
         now = time.time()
         cutoff = now - 60.0
         dq = self._hits.get(ip)
@@ -112,7 +114,8 @@ def create_app(
     )
 
     # ⚡ 限流中间件(放在最前面)
-    app.add_middleware(_RateLimitMiddleware, limit_per_min=rate_limit_per_min)
+    if rate_limit_per_min > 0:
+        app.add_middleware(_RateLimitMiddleware, limit_per_min=rate_limit_per_min)
 
     # 静态资源
     if WEB_DIR.exists():

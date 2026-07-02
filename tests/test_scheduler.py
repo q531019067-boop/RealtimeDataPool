@@ -68,6 +68,12 @@ class TestSchedulerCleanupInterval:
         s = Scheduler(pool, storage)
         assert s._last_cleanup_at == 0.0
 
+    def test_retention_days_configurable(self):
+        pool = InstrumentPool(instruments=[])
+        storage = Storage(Path(":memory:"))
+        s = Scheduler(pool, storage, retention_days=3)
+        assert s.retention_days == 3
+
 
 # ===== ⚡ P2-3 优化测试：run_once 透出 orderbook 统计 =====
 class TestRunOnceOrderbookStats:

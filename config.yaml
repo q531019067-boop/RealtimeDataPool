@@ -2,7 +2,7 @@ pool:
   fetch_interval_sec: 30
   orderbook_interval_sec: 300   # 盘口补全间隔（5min）。与基础行情解耦，削减 90%+ 腾讯请求
   cleanup_interval_sec: 1800    # P2 修复：清理过期 snapshot 间隔（30min）。原每 30s 太频。
-  fetch_out_of_session: true
+  fetch_out_of_session: false
   concurrency_per_source: 8
   sources:
   - eastmoney
