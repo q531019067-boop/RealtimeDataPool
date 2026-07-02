@@ -41,6 +41,134 @@ P95_LATENCY_THRESHOLD_S = 1.5
 # 滑动窗口大小（最近 N 次请求的延迟）
 LATENCY_WINDOW_SIZE = 100
 
+# 自适应并发的限流/恢复动作（2026-07-02 新增）
+#   THROTTLE → halve 当前 cap(下限 1)
+#   cleared  → 恢复 initial
+# 防 flapping:同方向连续触发至少间隔 N 个请求
+CONCURRENCY_HALVE_COOLDOWN = 50      # 两次 halve 之间至少 50 个请求
+CONCURRENCY_RESTORE_COOLDOWN = 200   # restore 后再次触发 throttle 至少 200 个请求
+CONCURRENCY_FLOOR = 1                # 不允许降到 0(会卡死所有请求)
+
+
+class _AdaptiveLimiter:
+    """运行时可调的并发限流器。
+
+    与 asyncio.Semaphore 的关键区别:可调用 adjust(new_cap) 在不重建对象的情况下
+    改变上限,适合"被限流时自动降并发 / 恢复时自动升并发"的场景。
+
+    语义:
+    - acquire(): 若 in_flight < current,立即 +1 返回;否则挂起到 Future
+    - release(): in_flight -1,唤醒一个 waiter 并**为它预留 slot**(waker reserve)
+    - adjust(new): 改变 current 上限
+        - 调高:按新增 slot 数唤醒 waiter,每个 waiter 获得预 reserved slot
+        - 调低:已在跑的请求不受影响,新 acquire 等 in_flight 掉到新上限以下
+
+    waker 关键设计:唤醒一个 waiter 时**立即为它预留 slot**(_in_flight += 1),
+    被唤醒的协程直接返回不再 re-check。这避免"全部唤醒 → 抢 slot → 部分 re-block"
+    的 thrashing。
+
+    只用于 asyncio 单线程事件循环。多线程不安全。
+    """
+
+    def __init__(self, initial: int):
+        if initial < 1:
+            raise ValueError("initial must be >= 1")
+        self._initial = initial
+        self._current = initial
+        self._in_flight = 0
+        self._waiters: Deque[asyncio.Future[None]] = deque()
+
+    @property
+    def current(self) -> int:
+        return self._current
+
+    @property
+    def initial(self) -> int:
+        return self._initial
+
+    @property
+    def in_flight(self) -> int:
+        return self._in_flight
+
+    @property
+    def waiting(self) -> int:
+        return len(self._waiters)
+
+    async def acquire(self) -> None:
+        # Fast path: 有 slot 立即 +1
+        if self._in_flight < self._current:
+            self._in_flight += 1
+            return
+        # Slow path: 挂起到 Future;被唤醒时 slot 已被 waker 预留,直接返回
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        self._waiters.append(fut)
+        try:
+            await fut
+        except BaseException:
+            # 取消时从 waiters 移除,避免僵尸
+            try:
+                self._waiters.remove(fut)
+            except ValueError:
+                pass
+            raise
+        # slot 已被 waker 在 _wake_one / adjust 里 +1 预留,这里直接 return
+
+    async def release(self) -> None:
+        if self._in_flight <= 0:
+            return  # 防御:重复 release 不崩
+        self._in_flight -= 1
+        self._wake_one()
+
+    def _wake_one(self) -> None:
+        """唤醒一个 waiter,**为它预留 slot**(关键设计)。
+
+        被唤醒的协程在 acquire() 末尾直接 return,不再 re-check _in_flight。
+        """
+        while self._waiters:
+            if self._in_flight >= self._current:
+                return
+            fut = self._waiters.popleft()
+            if not fut.done():
+                self._in_flight += 1  # ⚡ 关键:为被唤醒者预留 slot
+                fut.set_result(None)
+                return
+
+    def adjust(self, new_cap: int) -> int:
+        """调整上限。返回旧 cap 用于日志。
+
+        边界:
+        - 下限 [FLOOR]:不允许低于 FLOOR(默认 1,卡死)
+        - 上限:不强制(调用方负责)— throttling 自动调只会到 initial,人工传大值是故意
+        - 同值:no-op
+        - 调低:已在跑的请求不受影响,新 acquire 等 in_flight 掉到 new_cap 以下
+        - 调高:按新增 slot 数唤醒 waiter,每个 waiter 获得预 reserved slot
+        """
+        new_cap = max(CONCURRENCY_FLOOR, new_cap)
+        if new_cap == self._current:
+            return self._current
+        old = self._current
+        self._current = new_cap
+        # 调高时:按"有 slot 就唤醒"循环
+        if new_cap > old:
+            while self._waiters and self._in_flight < self._current:
+                fut = self._waiters.popleft()
+                if not fut.done():
+                    self._in_flight += 1  # ⚡ 预留 slot
+                    fut.set_result(None)
+        return old
+
+    def reset(self) -> int:
+        """恢复 initial 上限。返回旧 cap。"""
+        return self.adjust(self._initial)
+
+    async def __aenter__(self) -> "_AdaptiveLimiter":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.release()
+
 
 class _LatencyTracker:
     """滑动窗口：跟踪最近 N 次请求延迟，用于自适应 jitter + 限流检测。"""
@@ -130,9 +258,14 @@ class BaseFetcher(ABC):
         self.jitter_ms = jitter_ms
         self.retry_max = retry_max
         self._session: aiohttp.ClientSession | None = None
-        self._sem: asyncio.Semaphore | None = None
+        # ⚡ 2026-07-02: 用 _AdaptiveLimiter 替代 asyncio.Semaphore,
+        # 支持运行时降/升并发(被限流时自动降,恢复时自动升)。
+        self._limiter: _AdaptiveLimiter | None = None
         self._lat_tracker = _LatencyTracker()
         self._throttle_state: str = "normal"  # "normal" | "throttled"
+        # 限流/恢复动作的冷却计数器(防 flapping)
+        self._req_since_throttle_action: int = 0
+        self._req_since_restore: int = 0
 
     async def __aenter__(self) -> BaseFetcher:
         await self.start()
@@ -149,15 +282,17 @@ class BaseFetcher(ABC):
                 "Accept": "*/*",
             },
         )
-        self._sem = asyncio.Semaphore(self.concurrency)
+        self._limiter = _AdaptiveLimiter(self.concurrency)
         self._lat_tracker = _LatencyTracker()
         self._throttle_state = "normal"
+        self._req_since_throttle_action = 0
+        self._req_since_restore = 0
 
     async def close(self) -> None:
         if self._session:
             await self._session.close()
             self._session = None
-            self._sem = None
+        self._limiter = None
 
     async def _polite_get(self, url: str, **kwargs: Any) -> aiohttp.ClientResponse:
         """HTTP GET 加 jitter + retry + 限流自适应。
@@ -207,27 +342,68 @@ class BaseFetcher(ABC):
                         status=resp.status, message=f"HTTP {resp.status}",
                     )
 
-                # 4) 限流状态机：p95 漂移检测
+                # 4) 限流状态机：p95 漂移检测 + 自适应并发(2026-07-02)
+                #   - 检测到 THROTTLE → penalty jitter + halve 并发(冷却 N 请求防 flapping)
+                #   - throttle 清除    → 恢复 normal jitter + restore 到 initial 并发
                 p95 = self._lat_tracker.p95()
+                # 累计"自上次调整以来的请求数"用于冷却判定
+                self._req_since_throttle_action += 1
+                self._req_since_restore += 1
+
                 if p95 > P95_LATENCY_THRESHOLD_S and self._throttle_state == "normal":
                     self._throttle_state = "throttled"
-                    logger.warning(
-                        "%s: THROTTLE detected — p95 latency %.2fs > %.1fs threshold, "
-                        "switching to penalty jitter (%d-%dms). "
-                        "If this persists, consider lowering concurrency or "
-                        "decoupling orderbook fetch.",
-                        self.name, p95, P95_LATENCY_THRESHOLD_S,
-                        JITTER_PENALTY_MIN_MS, JITTER_PENALTY_MAX_MS,
-                    )
+                    old_cap = self._limiter.current
+                    # 冷却期内不重复 halve
+                    if self._req_since_throttle_action >= CONCURRENCY_HALVE_COOLDOWN:
+                        new_cap = max(CONCURRENCY_FLOOR, old_cap // 2)
+                        if new_cap < old_cap:
+                            self._limiter.adjust(new_cap)
+                            logger.warning(
+                                "%s: THROTTLE detected — p95=%.2fs > %.1fs, "
+                                "jitter→penalty, concurrency %d→%d (will restore on clear). "
+                                "If persistent, decoupling orderbook fetch helps.",
+                                self.name, p95, P95_LATENCY_THRESHOLD_S,
+                                old_cap, new_cap,
+                            )
+                        else:
+                            logger.warning(
+                                "%s: THROTTLE detected — p95=%.2fs > %.1fs, "
+                                "jitter→penalty, concurrency already at floor %d.",
+                                self.name, p95, P95_LATENCY_THRESHOLD_S, old_cap,
+                            )
+                    else:
+                        logger.warning(
+                            "%s: THROTTLE detected — p95=%.2fs > %.1fs, "
+                            "jitter→penalty (in cooldown %d/%d, concurrency unchanged).",
+                            self.name, p95, P95_LATENCY_THRESHOLD_S,
+                            self._req_since_throttle_action, CONCURRENCY_HALVE_COOLDOWN,
+                        )
+                    self._req_since_throttle_action = 0
                 elif (
                     p95 < P95_LATENCY_THRESHOLD_S * 0.5
                     and self._throttle_state == "throttled"
                 ):
                     self._throttle_state = "normal"
-                    logger.info(
-                        "%s: throttle cleared — p95=%.2fs, resuming normal jitter",
-                        self.name, p95,
-                    )
+                    old_cap = self._limiter.current
+                    # restore 需要更长冷却,避免 p95 抖动反复扩缩
+                    if (
+                        old_cap < self._limiter.initial
+                        and self._req_since_restore >= CONCURRENCY_RESTORE_COOLDOWN
+                    ):
+                        self._limiter.reset()
+                        logger.info(
+                            "%s: throttle cleared — p95=%.2fs, "
+                            "jitter→normal, concurrency restored %d→%d.",
+                            self.name, p95, old_cap, self._limiter.current,
+                        )
+                    else:
+                        logger.info(
+                            "%s: throttle cleared — p95=%.2fs, jitter→normal "
+                            "(concurrency restore cooldown %d/%d).",
+                            self.name, p95,
+                            self._req_since_restore, CONCURRENCY_RESTORE_COOLDOWN,
+                        )
+                    self._req_since_restore = 0
 
                 return resp
 
@@ -310,11 +486,11 @@ class EastmoneyFetcher(BaseFetcher):
     ]
 
     async def fetch(self, inst: Instrument) -> Quote | None:
-        if self._session is None or self._sem is None:
+        if self._session is None or self._limiter is None:
             raise RuntimeError("Fetcher not started")
         fields = ",".join(self._FIELDS)
         url = f"{self._BASE_URL}?secid={inst.secid}&fields={fields}"
-        async with self._sem:
+        async with self._limiter:
             try:
                 async with await self._polite_get(url) as resp:
                     resp.raise_for_status()

@@ -99,7 +99,9 @@ class TestEastmoneyPriceScaling:
         f = EastmoneyFetcher(concurrency=1)
         # 手动标记 started,塞 stub session
         f._session = StubSession(StubResp({"data": data}))
-        f._sem = __import__("asyncio").Semaphore(1)
+        # ⚡ 2026-07-02:_sem 改名为 _limiter,用 _AdaptiveLimiter
+        from rdp.fetcher import _AdaptiveLimiter
+        f._limiter = _AdaptiveLimiter(1)
 
         async def stub_get(url, **kw):
             return StubResp({"data": data})

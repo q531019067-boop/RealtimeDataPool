@@ -189,26 +189,21 @@ def create_app(
     ) -> list[dict[str, Any]]:
         """全市场最新快照，支持排序 + 涨跌幅过滤。
 
-        注意：sort_by 是按内存排序（数据量小，约 5400 只，OK）。
+        ⚡ 排序/过滤/limit 全部在 SQL 层完成(2026-07-02)。
+        sort_by 白名单: change_pct / price / open / high / low /
+        prev_close / volume / amount / fetched_at。其它值返回 400。
         """
-        rows = storage.query_latest()
-        if category:
-            rows = [r for r in rows if r.get("category") == category]
-        if min_change_pct is not None:
-            rows = [r for r in rows if (r.get("change_pct") or 0) >= min_change_pct]
-        if max_change_pct is not None:
-            rows = [r for r in rows if (r.get("change_pct") or 0) <= max_change_pct]
-
-        # 排序（None 排到最后）
-        def _sort_key(r: dict[str, Any]) -> float:
-            v = r.get(sort_by)
-            if v is None:
-                # 让 None 排到末尾（desc 方向）
-                return float("-inf") if order == "desc" else float("inf")
-            return float(v)
-
-        rows.sort(key=_sort_key, reverse=(order == "desc"))
-        return rows[:limit]
+        try:
+            return storage.query_latest_paged(
+                sort_by=sort_by,
+                order=order,
+                limit=limit,
+                category=category,
+                min_change_pct=min_change_pct,
+                max_change_pct=max_change_pct,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
 
     @app.get("/api/history")
     async def history(
