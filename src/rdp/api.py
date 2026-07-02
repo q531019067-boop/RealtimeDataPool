@@ -96,8 +96,15 @@ class _RateLimitMiddleware(BaseHTTPMiddleware):
 def create_app(
     storage: Storage,
     scheduler: Scheduler | None = None,
-    rate_limit_per_min: int = 60,
+    rate_limit_per_min: int | None = None,
 ) -> FastAPI:
+    # ⚡ rate limit 优先从 env RDP_RATE_LIMIT_PER_MIN 读,默认 60
+    if rate_limit_per_min is None:
+        import os
+        try:
+            rate_limit_per_min = int(os.environ.get("RDP_RATE_LIMIT_PER_MIN", "60"))
+        except ValueError:
+            rate_limit_per_min = 60
     app = FastAPI(
         title="RealtimeDataPool",
         description="A 股实时盯盘数据池 — 30s 级全市场快照",

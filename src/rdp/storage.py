@@ -199,14 +199,28 @@ class Storage:
         复用最新 snapshot 的 data_json，只覆盖 4 个盘口字段 + 新增 orderbook_fetched_at。
 
         返回 True 表示更新成功，False 表示找不到该 code 的 snapshot。
+
+        ⚡ 原子化 2026-07-02：直接拿到长连接，绕开 _write 上下文，
+        用 BEGIN IMMEDIATE + SELECT + UPDATE + COMMIT 包成单事务，
+        避免 basic insert 在 SELECT/Update 之间把 row 顶下去导致更新错行。
+        单进程场景下 race 概率极低,作为防御性编程加的,成本几乎 0。
         """
-        with self._write() as conn:
+        # 拿到长连接(等同 _write 但不走 ctx manager,免得 commit 冲突)
+        if self._conn is None:
+            self._conn = sqlite3.connect(self.db_path, timeout=30.0)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT id, data_json FROM snapshots WHERE code=? "
                 "ORDER BY fetched_at DESC LIMIT 1",
                 (code,),
             ).fetchone()
             if not row:
+                conn.execute("ROLLBACK")
                 return False
             data = json.loads(row["data_json"])
             data["bid_prices"] = bid_prices
@@ -218,6 +232,10 @@ class Storage:
                 "UPDATE snapshots SET data_json=? WHERE id=?",
                 (json.dumps(data, ensure_ascii=False), row["id"]),
             )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
         return True
 
     def query_latest(self, codes: list[str] | None = None) -> list[dict[str, Any]]:
