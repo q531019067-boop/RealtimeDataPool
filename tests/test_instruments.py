@@ -160,3 +160,68 @@ class TestApplyPoolConfig:
         codes = {i.code for i in out.instruments}
         assert "000001" not in codes
         assert "600519" in codes
+
+
+# ===== 性能优化测试：by_code O(1) dict 索引 =====
+class TestInstrumentPoolByCode:
+    """⚡ 优化：by_code O(N) 线性扫 → O(1) dict 索引。
+    实盘 5h 复盘发现 scheduler._run_orderbook 调 by_code 12K 次
+    × 池子 12K = 1.44 亿次比较，每 5 min 卡一下。"""
+
+    def test_by_code_returns_correct_instrument(self):
+        pool = InstrumentPool(
+            instruments=[
+                Instrument(code="000001", name="Pingan", market="sz", category="stock"),
+                Instrument(code="600519", name="Maotai", market="sh", category="stock"),
+            ],
+        )
+        assert pool.by_code("000001").name == "Pingan"
+        assert pool.by_code("600519").name == "Maotai"
+        assert pool.by_code("999999") is None
+
+    def test_by_code_index_rebuilt_on_init(self):
+        """__post_init__ 应该自动建 _index"""
+        pool = InstrumentPool(
+            instruments=[Instrument(code="X", name="x", market="sh", category="stock")],
+        )
+        assert "X" in pool._index
+        assert pool._index["X"].name == "x"
+
+    def test_by_code_works_with_12000_instruments(self):
+        """⚡ 性能:12K 池子,by_code 1000 次应该 < 100ms(O(1) 字典)"""
+        import time
+        from rdp.instruments import Instrument
+        # 构造 12K instrument
+        insts = [
+            Instrument(code=f"{i:06d}", name=f"N{i}", market="sh", category="stock")
+            for i in range(12000)
+        ]
+        pool = InstrumentPool(instruments=insts)
+        t0 = time.time()
+        for i in range(1000):
+            pool.by_code(f"{i % 12000:06d}")
+        elapsed = time.time() - t0
+        # 1000 次 dict lookup 应该 < 10ms,留 100ms 缓冲
+        assert elapsed < 0.1, f"by_code 1000 次耗时 {elapsed*1000:.1f}ms (应 < 100ms)"
+
+    def test_from_json_rebuilds_index(self):
+        """从 JSON 加载后 _index 也能用"""
+        pool = InstrumentPool.from_json(
+            '{"refreshed_at": 0, "instruments": [{"code": "X", "name": "x", "market": "sh", "category": "stock"}]}'
+        )
+        assert pool.by_code("X") is not None
+
+    def test_apply_pool_config_rebuilds_index(self):
+        """_apply_pool_config 出来的 pool._index 也能用"""
+        src = InstrumentPool(
+            instruments=[Instrument(code="X", name="x", market="sh", category="stock")],
+        )
+        out = _apply_pool_config(
+            src,
+            {"include_all_a_share": True, "include_etf": True,
+             "extra_codes": [{"code": "Y", "name": "y", "market": "sz", "category": "etf"}],
+             "exclude_codes": [], "max_pool_size": 0},
+        )
+        assert out.by_code("X") is not None
+        assert out.by_code("Y") is not None
+        assert out.by_code("Z") is None

@@ -103,15 +103,25 @@ class InstrumentPool:
 
     instruments: list[Instrument] = field(default_factory=list)
     refreshed_at: float = 0.0
+    # ⚡ 性能优化 2026-07-02：O(1) dict 索引。
+    # 原 by_code 是 O(N) 线性扫，scheduler 的 _run_orderbook 调用 12K 次
+    # × 12K = 1.44 亿次比较。改成 dict 索引后 = 12K 次。
+    # _index 在 from_json / from_config / __post_init__ 等入口处惰性建一次。
+    _index: dict[str, Instrument] = field(default_factory=dict, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._rebuild_index()
+
+    def _rebuild_index(self) -> None:
+        """重建 code -> Instrument 索引。改 instruments 后必须调。"""
+        self._index = {i.code: i for i in self.instruments}
 
     def codes(self) -> list[str]:
         return [i.code for i in self.instruments]
 
     def by_code(self, code: str) -> Instrument | None:
-        for i in self.instruments:
-            if i.code == code:
-                return i
-        return None
+        # ⚡ O(1) — 由 _index 索引
+        return self._index.get(code)
 
     def filter(self, category: str | None = None) -> list[Instrument]:
         if category is None:
@@ -133,6 +143,7 @@ class InstrumentPool:
     @classmethod
     def from_json(cls, raw: str) -> InstrumentPool:
         d = json.loads(raw)
+        # __post_init__ 会自动建 _index
         return cls(
             instruments=[Instrument.from_dict(x) for x in d["instruments"]],
             refreshed_at=d.get("refreshed_at", 0.0),
@@ -304,6 +315,7 @@ def _apply_pool_config(pool: InstrumentPool, cfg: dict[str, Any]) -> InstrumentP
         extras_added,
         max_size if max_size else "unlimited",
     )
+    # ⚡ __post_init__ 会自动建 _index
     return InstrumentPool(instruments=kept, refreshed_at=pool.refreshed_at)
 
 
