@@ -23,12 +23,24 @@ import yaml
 logger = logging.getLogger(__name__)
 
 # 东方财富股票列表接口（沪深京 A 股 + ETF + LOF 等）
+# ⚠️ P0-2 历史教训：2026-07-02 实盘 5h 复盘发现，原注释的 m:t 语义**完全反了**。
+# 实际通过 m:t 探测验证（pn=1, pz=20, fid=f3）：
+#   m:0+t:6   → 深圳 A 股主板（00*）
+#   m:0+t:80  → 深圳 创业板（30*，**不是上交所 ETF**）
+#   m:0+t:81  → 北交所（92*, 83*, 87*，**不是上交所 LOF**）
+#   m:1+t:2   → 沪市 A 股主板（60*，**不是深交所主板**）
+#   m:1+t:23  → 沪市 科创板（68*，**不是深交所创业板**）
+#   m:1+t:22  → 空
+# 结论：原代码用 m:0 表示沪市、m:1 表示深市是反的，应该是 m:0=深 m:1=沪。
+# 另外原 fs 列表**没有包含任何 ETF 段**，所以 cache 拉下来 0 个 51* / 15* ETF，
+# 5h 跑了 12,378 个 code 全部 category="stock"。
 _EASTMONEY_LIST_URL = (
     "https://push2.eastmoney.com/api/qt/clist/get"
     "?pn={page}&pz={size}&po=1&fid=f3"
-    # m:0+t:6 上交所 A 股 | m:0+t:80 上交所 ETF | m:1+t:2 深交所 A 股主板
-    # m:1+t:23 深交所创业板 | m:0+t:81 上交所 LOF | m:1+t:22 深交所 LOF
-    "&fs=m:0+t:6,m:0+t:80,m:0+t:81,m:1+t:2,m:1+t:23,m:1+t:22"
+    # 沪深 A 股 + 创业板 + 科创板 + 北交所（已验证）
+    "&fs=m:0+t:6,m:0+t:80,m:0+t:81,m:1+t:2,m:1+t:23"
+    # 已知 ETF/LOF 段（待 refresh-pool 时验证 2026-07-02 后东财是否还返回 ETF 数据）：
+    # ,m:1+t:8,m:0+t:8,m:1+t:80,m:0+t:80  ← 实测被东财 ban 期间无法验证
     "&fields=f12,f14,f13"  # f12=代码 f14=名称 f13=市场(0=深 1=沪)
 )
 
@@ -230,10 +242,15 @@ class InstrumentPool:
 
 
 def _apply_pool_config(pool: InstrumentPool, cfg: dict[str, Any]) -> InstrumentPool:
-    """按配置裁剪股票池：exclude / extra / max。"""
+    """按配置裁剪股票池：exclude / extra / max。
+
+    extra_codes 支持两种格式：
+    - str: 6 位代码（仅在池子里能找到对应 Instrument 时才追加）
+    - dict: {code, name, market, category} 完整 Instrument 信息（即使池子里没有也会创建）
+    """
     include_all = cfg.get("include_all_a_share", True)
     include_etf = cfg.get("include_etf", True)
-    extra_codes = set(cfg.get("extra_codes", []))
+    extra_codes = cfg.get("extra_codes", []) or []
     exclude_codes = set(cfg.get("exclude_codes", []))
     max_size = int(cfg.get("max_pool_size", 0) or 0)
 
@@ -249,21 +266,42 @@ def _apply_pool_config(pool: InstrumentPool, cfg: dict[str, Any]) -> InstrumentP
 
     # 追加 extra（如果不在池里）
     existing_codes = {i.code for i in kept}
-    for code in extra_codes:
-        if code not in existing_codes:
+    extras_added = 0
+    for item in extra_codes:
+        if isinstance(item, str):
+            # 旧格式：纯代码
+            code = item
+            if code in existing_codes:
+                continue
             ref = pool.by_code(code)
             if ref is not None:
                 kept.append(ref)
+                existing_codes.add(code)
+                extras_added += 1
+        elif isinstance(item, dict):
+            # 新格式：完整 Instrument 信息
+            try:
+                inst = Instrument.from_dict(item)
+            except Exception as exc:
+                logger.warning("extra_codes dict parse failed for %r: %s", item, exc)
+                continue
+            if inst.code in existing_codes:
+                continue
+            kept.append(inst)
+            existing_codes.add(inst.code)
+            extras_added += 1
+        else:
+            logger.warning("extra_codes item not str or dict: %r", item)
 
     # 限制最大尺寸（调试 / 测试用）
     if max_size > 0 and len(kept) > max_size:
         kept = kept[:max_size]
 
     logger.info(
-        "Pool configured: kept=%d (excluded=%d, extra_added=%d, max=%s)",
+        "Pool configured: kept=%d (excluded=%d, extras_added=%d, max=%s)",
         len(kept),
         len(pool.instruments) - len(kept),
-        len(extra_codes - existing_codes),
+        extras_added,
         max_size if max_size else "unlimited",
     )
     return InstrumentPool(instruments=kept, refreshed_at=pool.refreshed_at)

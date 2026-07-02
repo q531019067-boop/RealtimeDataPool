@@ -70,6 +70,7 @@ async def _serve(cfg: dict, host: str, port: int) -> None:
         storage,
         fetch_interval_sec=cfg["pool"]["fetch_interval_sec"],
         orderbook_interval_sec=cfg["pool"].get("orderbook_interval_sec", 300),
+        cleanup_interval_sec=cfg["pool"].get("cleanup_interval_sec", 1800),
         fetch_out_of_session=cfg["pool"]["fetch_out_of_session"],
         sources=cfg["pool"]["sources"],
         concurrency=cfg["pool"]["concurrency_per_source"],

@@ -1,6 +1,7 @@
 pool:
   fetch_interval_sec: 30
   orderbook_interval_sec: 300   # 盘口补全间隔（5min）。与基础行情解耦，削减 90%+ 腾讯请求
+  cleanup_interval_sec: 1800    # P2 修复：清理过期 snapshot 间隔（30min）。原每 30s 太频。
   fetch_out_of_session: true
   concurrency_per_source: 8
   sources:
@@ -11,7 +12,33 @@ pool:
 instruments:
   include_all_a_share: true
   include_etf: true
-  extra_codes: []
+  # 手动追加的代码 — 修补 cache 漏抓的标的。
+  # P0-2 教训：2026-07-02 实盘 5h 复盘发现 eastmoney fs 列表不含 ETF/LOF 段，
+  # 导致 cache 拉下来 0 个 51* / 15* ETF。下面用 dict 格式手动补主要 ETF/LOF，
+  # 等下次 refresh-pool 后确认 m:t 段是否需要再调整，可以删掉这份 list。
+  # 格式：{code, name, market, category} - market: sh / sz, category: stock / etf / lof
+  extra_codes:
+    # 沪深 300 ETF（最常用）
+    - {code: "510300", name: "沪深300ETF", market: "sh", category: "etf"}
+    - {code: "510330", name: "300ETF基金", market: "sh", category: "etf"}
+    - {code: "159919", name: "沪深300ETF", market: "sz", category: "etf"}
+    # 中证 500 ETF
+    - {code: "510500", name: "中证500ETF", market: "sh", category: "etf"}
+    - {code: "159922", name: "中证500ETF", market: "sz", category: "etf"}
+    # 创业板 ETF
+    - {code: "159915", name: "创业板ETF", market: "sz", category: "etf"}
+    # 科创 50 / 板 50
+    - {code: "588000", name: "科创50ETF", market: "sh", category: "etf"}
+    - {code: "588080", name: "科创板50ETF", market: "sh", category: "etf"}
+    # 50ETF
+    - {code: "510050", name: "上证50ETF", market: "sh", category: "etf"}
+    # 黄金 ETF
+    - {code: "518880", name: "黄金ETF", market: "sh", category: "etf"}
+    # 纳指 / 标普
+    - {code: "513100", name: "纳指ETF", market: "sh", category: "etf"}
+    - {code: "513500", name: "标普500ETF", market: "sh", category: "etf"}
+    # 常见 LOF
+    - {code: "163406", name: "兴全合润分级", market: "sz", category: "lof"}
   exclude_codes: []
   max_pool_size: 0
 storage:

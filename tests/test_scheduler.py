@@ -1,10 +1,13 @@
 """交易时段判断的单元测试。"""
 
 from datetime import datetime, time
+from pathlib import Path
 
 import pytest
 
-from rdp.scheduler import is_trading_session
+from rdp.instruments import InstrumentPool
+from rdp.scheduler import Scheduler, is_trading_session
+from rdp.storage import Storage
 
 
 class TestTradingSession:
@@ -37,3 +40,30 @@ class TestTradingSession:
     )
     def test_session(self, dt: datetime, expected: bool):
         assert is_trading_session(dt) is expected
+
+
+# ===== P2 修复测试：cleanup_interval_sec 默认值 + 可配置 =====
+class TestSchedulerCleanupInterval:
+    """P2 修复：cleanup_old_snapshots 之前每 30s 跑(太频),
+    改为按 cleanup_interval_sec 跑(默认 1800s = 30min)。"""
+
+    def test_default_cleanup_interval_is_1800(self):
+        """默认 1800s = 30min,而不是原 30s(随 fetch_interval 跑)"""
+        pool = InstrumentPool(instruments=[])
+        storage = Storage(Path(":memory:"))
+        s = Scheduler(pool, storage, fetch_interval_sec=30)
+        assert s.cleanup_interval_sec == 1800
+
+    def test_cleanup_interval_configurable(self):
+        """可从构造参数覆盖"""
+        pool = InstrumentPool(instruments=[])
+        storage = Storage(Path(":memory:"))
+        s = Scheduler(pool, storage, fetch_interval_sec=30, cleanup_interval_sec=600)
+        assert s.cleanup_interval_sec == 600
+
+    def test_last_cleanup_at_initial_zero(self):
+        """初始 _last_cleanup_at = 0,首次 cycle 会跑 cleanup"""
+        pool = InstrumentPool(instruments=[])
+        storage = Storage(Path(":memory:"))
+        s = Scheduler(pool, storage)
+        assert s._last_cleanup_at == 0.0

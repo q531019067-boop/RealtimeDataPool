@@ -343,8 +343,14 @@ class EastmoneyFetcher(BaseFetcher):
             except (TypeError, ValueError):
                 return None
 
-        # f152 = 价格小数位（2 表示 0.01 元精度）
-        scale = 10 ** int(_num("f152") or 2)
+        # f152 = 价格小数位（2 表示 0.01 元精度）。
+        # ⚠️ 东财对 ETF/LOF 的 f152 不可靠（实测 f152=2 但实际是 3 位小数），
+        # 会导致 510300/510500/159915 等 ETF 的 price/open/high/low/prev_close 10x 偏大。
+        # 用 category 强制覆盖：etf/lof 走 1000，stock 走 f152 或默认 2。
+        if inst.category in ("etf", "lof"):
+            scale = 1000
+        else:
+            scale = 10 ** int(_num("f152") or 2)
 
         def _price(key: str) -> float | None:
             v = _num(key)
@@ -423,6 +429,9 @@ class SinaFetcher(BaseFetcher):
             raise RuntimeError("Fetcher not started")
         # 分片
         out: list[Quote] = []
+        n_batches = (len(instruments) + self._BATCH_SIZE - 1) // self._BATCH_SIZE
+        n_failed = 0
+        n_codes_lost = 0
         for chunk in _chunks(instruments, self._BATCH_SIZE):
             symbols = ",".join(i.sina_symbol for i in chunk)
             url = self._BASE_URL.format(symbols=symbols)
@@ -435,7 +444,13 @@ class SinaFetcher(BaseFetcher):
                     resp.raise_for_status()
                     text = await resp.text(encoding="gbk")
             except Exception as exc:
-                logger.debug("Sina batch fetch failed: %s", exc)
+                # ⚠️ P0-1 修复：batch 失败升级到 WARNING（之前是 debug 静默）
+                n_failed += 1
+                n_codes_lost += len(chunk)
+                logger.warning(
+                    "%s: batch fetch failed (%d codes lost): %s",
+                    self.name, len(chunk), exc,
+                )
                 continue
 
             # 解析：var sh600000="平安银行,1.00,...";
@@ -457,6 +472,11 @@ class SinaFetcher(BaseFetcher):
                         out.append(quote)
                 except Exception as exc:
                     logger.debug("Sina parse error for %r: %s", line[:80], exc)
+        if n_failed:
+            logger.warning(
+                "%s: %d/%d batches failed, %d codes lost (will retry next cycle)",
+                self.name, n_failed, n_batches, n_codes_lost,
+            )
         return out
 
 
@@ -554,6 +574,9 @@ class TencentFetcher(BaseFetcher):
         if self._session is None:
             raise RuntimeError("Fetcher not started")
         out: list[Quote] = []
+        n_batches = (len(instruments) + self._BATCH_SIZE - 1) // self._BATCH_SIZE
+        n_failed = 0
+        n_codes_lost = 0
         for chunk in _chunks(instruments, self._BATCH_SIZE):
             symbols = ",".join(i.tencent_symbol for i in chunk)
             url = self._BASE_URL.format(symbols=symbols)
@@ -562,7 +585,13 @@ class TencentFetcher(BaseFetcher):
                     resp.raise_for_status()
                     text = await resp.text(encoding="gbk")
             except Exception as exc:
-                logger.debug("Tencent batch fetch failed: %s", exc)
+                # ⚠️ P0-1 修复：batch 失败升级到 WARNING
+                n_failed += 1
+                n_codes_lost += len(chunk)
+                logger.warning(
+                    "%s: batch fetch failed (%d codes lost): %s",
+                    self.name, len(chunk), exc,
+                )
                 continue
 
             for line in text.strip().splitlines():
@@ -583,6 +612,11 @@ class TencentFetcher(BaseFetcher):
                         out.append(quote)
                 except Exception as exc:
                     logger.debug("Tencent parse error for %r: %s", line[:80], exc)
+        if n_failed:
+            logger.warning(
+                "%s: %d/%d batches failed, %d codes lost (will retry next cycle)",
+                self.name, n_failed, n_batches, n_codes_lost,
+            )
         return out
 
     async def fetch_orderbook_batch(
@@ -600,6 +634,9 @@ class TencentFetcher(BaseFetcher):
         if not instruments:
             return {}
         out: dict[str, dict] = {}
+        n_batches = (len(instruments) + self._BATCH_SIZE - 1) // self._BATCH_SIZE
+        n_failed = 0
+        n_codes_lost = 0
         for chunk in _chunks(instruments, self._BATCH_SIZE):
             symbols = ",".join(i.tencent_symbol for i in chunk)
             url = self._BASE_URL.format(symbols=symbols)
@@ -608,7 +645,15 @@ class TencentFetcher(BaseFetcher):
                     resp.raise_for_status()
                     text = await resp.text(encoding="gbk")
             except Exception as exc:
-                logger.debug("Tencent orderbook batch failed: %s", exc)
+                # ⚠️ P0-1 修复：orderbook batch 失败升级到 WARNING
+                # 历史教训：5h 实盘 31 个 orderbook 周期,每次都是 5322/12064 恒定 44.1%,
+                # 全靠这个 debug 静默吞掉,监控完全看不见。
+                n_failed += 1
+                n_codes_lost += len(chunk)
+                logger.warning(
+                    "%s: orderbook batch failed (%d codes lost): %s",
+                    self.name, len(chunk), exc,
+                )
                 continue
 
             for line in text.strip().splitlines():
@@ -636,6 +681,11 @@ class TencentFetcher(BaseFetcher):
                     }
                 except Exception as exc:
                     logger.debug("Tencent orderbook parse error: %s", exc)
+        if n_failed:
+            logger.warning(
+                "%s orderbook: %d/%d batches failed, %d codes without bid/ask (will retry next orderbook cycle in %ds)",
+                self.name, n_failed, n_batches, n_codes_lost, 0,  # 0 占位:实际间隔由 Scheduler 决定
+            )
         return out
 
 

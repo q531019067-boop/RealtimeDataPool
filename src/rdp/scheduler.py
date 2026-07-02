@@ -54,6 +54,7 @@ class Scheduler:
         *,
         fetch_interval_sec: int = 30,
         orderbook_interval_sec: int = 300,
+        cleanup_interval_sec: int = 1800,  # P2: 30min 一次
         fetch_out_of_session: bool = False,
         sources: list[str] | None = None,
         concurrency: int = 8,
@@ -64,6 +65,7 @@ class Scheduler:
         self.storage = storage
         self.fetch_interval_sec = fetch_interval_sec
         self.orderbook_interval_sec = orderbook_interval_sec
+        self.cleanup_interval_sec = cleanup_interval_sec
         self.fetch_out_of_session = fetch_out_of_session
         self.sources = sources or ["eastmoney", "sina", "tencent"]
         self.concurrency = concurrency
@@ -83,6 +85,9 @@ class Scheduler:
         self._orderbook_count: int = 0        # 盘口补全累计次数
         self._last_session_state: bool | None = None  # 上一刻交易时段状态（用于状态切换日志）
         self._idle_heartbeat_remaining: int = 20  # 空转期心跳间隔（按 cycle 计）
+        # P2 修复：cleanup 不再每周期跑（30s/次太频，DELETE 会扫表 200M+ 行），
+        # 改为每 cleanup_interval_sec 一次（默认 1800s = 30min）。
+        self._last_cleanup_at: float = 0.0
 
     async def run_once(self) -> dict[str, int | float | str]:
         """CLI one-shot 入口：跑一次完整 basic + orderbook。"""
@@ -353,11 +358,16 @@ class Scheduler:
                 except Exception:
                     logger.exception("Orderbook iteration failed")
 
-            # 清理过期数据
-            try:
-                self.storage.cleanup_old_snapshots(retention_days=7)
-            except Exception:
-                logger.exception("Cleanup failed")
+            # 清理过期数据 — P2 修复：每 cleanup_interval_sec 跑一次，不再每 30s
+            if (
+                self._last_cleanup_at == 0.0
+                or time.time() - self._last_cleanup_at >= self.cleanup_interval_sec
+            ):
+                try:
+                    self.storage.cleanup_old_snapshots(retention_days=7)
+                    self._last_cleanup_at = time.time()
+                except Exception:
+                    logger.exception("Cleanup failed")
 
             await asyncio.sleep(self.fetch_interval_sec)
 
