@@ -321,6 +321,19 @@ class Storage:
                 (time.time(), count_ok, count_valid, count_stale, error, run_id),
             )
 
+    def update_fetch_run_source(self, run_id: int, source: str) -> None:
+        """⚡ 修正 fetch_runs.source — 实际 fetch_with_fallback 命中的源(可能不是 sources[0])。
+
+        实盘 5h 数据:全部 cycle 都写 "eastmoney" 即使回退到 sina/tencent,
+        导致 fetch_runs.source 字段误导。Scheduler start_fetch_run 时先用
+        self.sources[0] 占位,fetch 完后用本方法修正。
+        """
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE fetch_runs SET source=? WHERE id=?",
+                (source, run_id),
+            )
+
     def recent_runs(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(

@@ -90,11 +90,17 @@ class Scheduler:
         self._last_cleanup_at: float = 0.0
 
     async def run_once(self) -> dict[str, int | float | str]:
-        """CLI one-shot 入口：跑一次完整 basic + orderbook。"""
+        """CLI one-shot 入口：跑一次完整 basic + orderbook。
+
+        返回值包含 basic 周期统计 + orderbook 周期统计（如果跑了），
+        方便 CLI 一次性输出完整结果。
+        """
         basic_result = await self._run_basic()
+        orderbook_result: dict[str, int | float | str] = {}
         if basic_result.get("ok", 0) > 0:
-            await self._run_orderbook()
-        return basic_result
+            orderbook_result = await self._run_orderbook()
+        # ⚡ 合并 orderbook 统计(observability)
+        return {**basic_result, "orderbook": orderbook_result}
 
     async def _run_basic(self) -> dict[str, int | float | str]:
         """基础行情周期：拉一次全市场基础字段，写库。
@@ -104,6 +110,8 @@ class Scheduler:
         t0 = time.time()
         cycle_id = self._cycle_count
         instruments = self.pool.instruments
+        # ⚡ 用 self.sources[0] 占位(实际源由 fetch_with_fallback 返回),
+        # 在 fetch 完后用 storage.update_fetch_run_source 修正(P2-3 优化)。
         run_id = self.storage.start_fetch_run(self.sources[0], len(instruments))
 
         gap_since_last = (
@@ -112,7 +120,7 @@ class Scheduler:
 
         fetch_t0 = time.time()
         try:
-            quotes = await fetch_with_fallback(
+            quotes, source_used = await fetch_with_fallback(
                 instruments, self.sources,
                 concurrency=self.concurrency,
                 jitter_ms=self.jitter_ms,
@@ -148,6 +156,9 @@ class Scheduler:
         self.storage.finish_fetch_run(
             run_id, count_ok, count_valid, count_stale
         )
+        # ⚡ 修正 fetch_runs.source 为实际命中源
+        if source_used and source_used != self.sources[0]:
+            self.storage.update_fetch_run_source(run_id, source_used)
 
         elapsed = time.time() - t0
         now_ts = time.time()
@@ -163,8 +174,9 @@ class Scheduler:
             drift_str = f" gap={gap_since_last:.1f}s(Δ{drift:+.1f}s)"
         data_age_str = f" data_age={data_age:.1f}s" if data_age is not None else ""
 
+        # ⚡ 状态行 src= 用实际命中的源(可能 fallback 了)
         status = (
-            f"cycle=#{cycle_id} src={self.sources[0]} "
+            f"cycle=#{cycle_id} src={source_used or self.sources[0]} "
             f"ok={count_ok}/{len(instruments)} valid={count_valid}({valid_pct:.1f}%) "
             f"stale={count_stale} ob={count_ob} "
             f"fetch={fetch_elapsed:.1f}s db={db_elapsed:.2f}s total={elapsed:.1f}s"
@@ -207,7 +219,7 @@ class Scheduler:
             "valid": count_valid,
             "stale": count_stale,
             "elapsed": elapsed,
-            "source": self.sources[0],
+            "source": source_used or self.sources[0],  # ⚡ 实际命中源
             "inserted": inserted,
         }
 

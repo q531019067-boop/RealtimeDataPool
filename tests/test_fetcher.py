@@ -193,3 +193,18 @@ class TestEastmoneyPriceScaling:
         assert q.change == pytest.approx(-0.086)
         # f170=-1.72 % already in percent
         assert q.change_pct == pytest.approx(-0.0172)
+
+
+# ===== fetch_with_fallback 新签名测试 =====
+class TestFetchWithFallbackSignature:
+    """⚡ 优化：fetch_with_fallback 现在返回 (results, source_used) 让
+    Scheduler 知道实际命中了哪个源(可能 fallback 到 sina/tencent)。"""
+
+    def test_signature_returns_tuple(self):
+        """签名应该是 (results, source_used) 不是 list[Quote]"""
+        import inspect
+        from rdp.fetcher import fetch_with_fallback
+        sig = inspect.signature(fetch_with_fallback)
+        ret = sig.return_annotation
+        # 现在是 tuple[list[Quote], str | None]
+        assert "tuple" in str(ret).lower() or "Tuple" in str(ret)

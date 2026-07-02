@@ -10,18 +10,23 @@
 - GET  /api/history               单只历史快照
 - GET  /api/runs                  抓取运行日志
 - GET  /                          监控页面
+
+安全：内置 in-memory rate limit 中间件(60 req/min per IP,白名单 localhost)
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 
 from .scheduler import Scheduler
 from .storage import Storage
@@ -32,12 +37,75 @@ ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT / "web"
 
 
-def create_app(storage: Storage, scheduler: Scheduler | None = None) -> FastAPI:
+# ---------- Rate Limit 中间件 ----------
+class _RateLimitMiddleware(BaseHTTPMiddleware):
+    """简单 in-memory sliding window rate limit。
+
+    - 60 req/min per IP(默认),可通过环境变量 RDP_RATE_LIMIT_PER_MIN 覆盖
+    - localhost 白名单
+    - 超过返回 429 + Retry-After header
+    - 内存占用:每个 IP 一个 deque,64 个时间戳 * 8 bytes = 512B,1000 IP = 512KB
+    """
+
+    def __init__(self, app, limit_per_min: int = 60):
+        super().__init__(app)
+        self.limit = limit_per_min
+        # {ip: deque[float]}
+        self._hits: dict[str, deque] = {}
+
+    def _check(self, ip: str) -> tuple[bool, int]:
+        """返回 (allowed, retry_after_sec)."""
+        now = time.time()
+        cutoff = now - 60.0
+        dq = self._hits.get(ip)
+        if dq is None:
+            dq = deque()
+            self._hits[ip] = dq
+        # 清掉过期的
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        if len(dq) >= self.limit:
+            # 最早一个过期时间 = retry_after
+            retry = max(1, int(60 - (now - dq[0])))
+            return False, retry
+        dq.append(now)
+        return True, 0
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        # 健康检查 + 静态资源不限流
+        path = request.url.path
+        if path in ("/api/health", "/") or path.startswith("/assets"):
+            return await call_next(request)
+
+        client_ip = request.client.host if request.client else "unknown"
+        # localhost / 127.0.0.1 / 内网白名单
+        if client_ip in ("127.0.0.1", "::1", "localhost"):
+            return await call_next(request)
+
+        allowed, retry = self._check(client_ip)
+        if not allowed:
+            logger.warning("Rate limit hit: %s on %s", client_ip, path)
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too Many Requests", "retry_after_sec": retry},
+                headers={"Retry-After": str(retry)},
+            )
+        return await call_next(request)
+
+
+def create_app(
+    storage: Storage,
+    scheduler: Scheduler | None = None,
+    rate_limit_per_min: int = 60,
+) -> FastAPI:
     app = FastAPI(
         title="RealtimeDataPool",
         description="A 股实时盯盘数据池 — 30s 级全市场快照",
         version="0.1.0",
     )
+
+    # ⚡ 限流中间件(放在最前面)
+    app.add_middleware(_RateLimitMiddleware, limit_per_min=rate_limit_per_min)
 
     # 静态资源
     if WEB_DIR.exists():

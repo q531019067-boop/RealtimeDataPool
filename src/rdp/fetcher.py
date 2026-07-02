@@ -778,17 +778,23 @@ async def fetch_with_fallback(
     concurrency: int = 8,
     jitter_ms: int = DEFAULT_JITTER_MS,
     retry_max: int = 1,
-) -> list[Quote]:
+) -> tuple[list[Quote], str | None]:
     """按顺序尝试数据源，主源失败率 > 30% 自动降级到下一源。
 
     只抓基础行情，盘口五档由 Scheduler 通过 TencentFetcher.fetch_orderbook_batch
     在独立周期（默认 5min）单独补全。
+
+    Returns:
+        (results, source_used) — source_used 是实际命中主源的名称,
+        全部失败时是 None。Scheduler 用这个写 fetch_runs.source,
+        而不是写 sources[0](可能有误导)。
 
     反爬参数：
     - jitter_ms: 每请求前的随机延迟上限（毫秒）。打破齐刷刷时序。
     - retry_max: 5xx/连接错误的最大重试次数。
     """
     last_results: list[Quote] = []
+    last_source: str | None = None
     for src_name in sources:
         cls = FETCHER_REGISTRY.get(src_name)
         if cls is None:
@@ -819,8 +825,9 @@ async def fetch_with_fallback(
 
         if valid / max(success, 1) >= 0.7 or not last_results:
             last_results = results
+            last_source = src_name
             if valid > 0:
-                return results
+                return results, src_name
             else:
                 logger.warning(
                     "Source %s returned ZERO valid quotes — trying next source",
@@ -834,5 +841,6 @@ async def fetch_with_fallback(
                 src_name, valid, success, valid_pct,
             )
             last_results = results
+            last_source = src_name
 
-    return last_results
+    return last_results, last_source

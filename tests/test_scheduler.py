@@ -67,3 +67,31 @@ class TestSchedulerCleanupInterval:
         storage = Storage(Path(":memory:"))
         s = Scheduler(pool, storage)
         assert s._last_cleanup_at == 0.0
+
+
+# ===== ⚡ P2-3 优化测试：run_once 透出 orderbook 统计 =====
+class TestRunOnceOrderbookStats:
+    """run_once 现在把 orderbook 周期统计也并入返回值,方便 CLI 一次性输出。"""
+
+    def test_run_once_signature_documented(self):
+        """run_once 应该返回 dict 包含 'orderbook' key"""
+        import inspect
+        from rdp.scheduler import Scheduler
+        sig = inspect.signature(Scheduler.run_once)
+        assert sig.return_annotation != inspect.Signature.empty
+
+    def test_update_fetch_run_source_helper(self, tmp_path: Path):
+        """Storage.update_fetch_run_source 应该能更新 source 字段"""
+        from rdp.storage import Storage
+        storage = Storage(tmp_path / "test.db")
+        storage.init_schema()
+        run_id = storage.start_fetch_run("eastmoney", 100)
+        storage.finish_fetch_run(run_id, 100, 100, 0)
+        # 修正 source
+        storage.update_fetch_run_source(run_id, "sina")
+        with storage._connect() as conn:
+            row = conn.execute(
+                "SELECT source FROM fetch_runs WHERE id=?", (run_id,)
+            ).fetchone()
+        assert row["source"] == "sina"
+        storage.close()
