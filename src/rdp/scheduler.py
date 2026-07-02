@@ -210,6 +210,17 @@ class Scheduler:
                 cycle_id, data_age,
             )
 
+        # ── 逐股详情 ──
+        for q in quotes:
+            if q.price is None:
+                logger.info("  %s %s — 无数据", q.code, q.name)
+                continue
+            chg = f"{q.change_pct:+.2f}%" if q.change_pct is not None else ""
+            vol_str = f"成交量={_fmt_vol(q.volume)}" if q.volume is not None else ""
+            amt_str = f"成交额={_fmt_amt(q.amount)}" if q.amount is not None else ""
+            details = " ".join(filter(None, [chg, vol_str, amt_str]))
+            logger.info("  %s %s ¥%.2f %s", q.code, q.name, q.price, details)
+
         self._last_run_id = run_id
         self._last_run_status = status
         self._last_cycle_at = now_ts
