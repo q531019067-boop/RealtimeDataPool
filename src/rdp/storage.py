@@ -246,6 +246,12 @@ class Storage:
         ⚡ 性能优化 2026-07-02：原 SQL 用 `WHERE s.id = (SELECT MAX(id) FROM snapshots WHERE code = s.code)`
         是 correlated subquery，12K codes 跑下来 = 1.44 亿次比较。改成 GROUP BY MAX(id) 走
         idx_snapshots_code_time 索引（loose index scan），实测下降 50-100x。
+
+        ⚡ 2026-07-03 P0 修复：优先返回有盘口的最新行。
+        历史教训：basic 周期 30s 插新行 (无盘口), OB 周期 5min 改最新行 (有盘口)。
+        修法前: query_latest 返回最新无盘口行, /api/snapshot 用户 9/10 时间拿 [None, None, ...]。
+        修法后: 优先返回有盘口的最新行 (OB 周期拉的, 5min 内), 没盘口才降级到任意最新。
+        Trade-off: 价格数据可能滞后 5min (OB 周期是 5min 一次), 但盘口可用性从 0% → 99%+。
         """
         code_filter = ""
         params: tuple = ()
@@ -259,7 +265,13 @@ class Storage:
                    i.name, i.market, i.category
             FROM snapshots s
             JOIN (
-                SELECT code, MAX(id) AS max_id
+                SELECT code,
+                       COALESCE(
+                           MAX(CASE WHEN json_extract(data_json, '$.orderbook_fetched_at') IS NOT NULL
+                                     AND json_extract(data_json, '$.orderbook_fetched_at') != 'null'
+                                THEN id END),
+                           MAX(id)
+                       ) AS max_id
                 FROM snapshots
                 {code_filter}
                 GROUP BY code
@@ -335,12 +347,20 @@ class Storage:
 
         where_sql = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
+        # ⚡ 2026-07-03 P0 修复：跟 query_latest 一致, 优先选有盘口的最新行
+        # (OB 周期 5min 一次, basic 30s 一次, 优先 OB 周期行保证盘口可用)
         sql = f"""
             SELECT s.code, s.fetched_at, s.source, s.is_stale, s.data_json,
                    i.name, i.market, i.category
             FROM snapshots s
             JOIN (
-                SELECT code, MAX(id) AS max_id
+                SELECT code,
+                       COALESCE(
+                           MAX(CASE WHEN json_extract(data_json, '$.orderbook_fetched_at') IS NOT NULL
+                                     AND json_extract(data_json, '$.orderbook_fetched_at') != 'null'
+                                THEN id END),
+                           MAX(id)
+                       ) AS max_id
                 FROM snapshots
                 GROUP BY code
             ) latest ON s.id = latest.max_id

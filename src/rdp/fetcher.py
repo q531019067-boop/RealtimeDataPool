@@ -725,6 +725,8 @@ def _parse_sina(inst: Instrument, fields: list[str]) -> Quote | None:
         volume_hands = volume_shares / 100.0 if volume_shares is not None else None
         amount = float(fields[9]) if fields[9] else None
         change = (price - prev_close) if (price is not None and prev_close is not None) else None
+        # ⚡ 2026-07-03: 与东财/腾讯对齐, 存**百分比值** (2.22 = +2.22%)。
+        # 老代码 `* 100` 已经存百分比, 不动; 跟 storage 中已有数据兼容。
         change_pct = (change / prev_close * 100) if (change is not None and prev_close) else None
 
         bid_prices = [bid1] + [None] * 4
@@ -927,7 +929,13 @@ def _parse_tencent(inst: Instrument, fields: list[str]) -> Quote | None:
         volume = _f(6)  # 已经是手
         high = _f(33)
         low = _f(34)
-        change_pct = _f(32)
+        # ⚡ 2026-07-03 P0-2 修复：腾讯 fields[32] 是 "百分比 × 100" 的 raw 整数
+        # (e.g. +2.22% → raw 222)。老代码直接 _f(32) 存进 db 是 222,
+        # 跟东财/新浪的 2.22 差 100 倍, 导致 /api/snapshots/all?sort_by=change_pct
+        # 排序时, 腾讯源的标的全在 top/bottom 极端位置 (错位 100x)。
+        # 修法: 跟东财/新浪对齐, 都存**百分比值** (2.22 = +2.22%)。
+        change_pct_raw = _f(32)
+        change_pct = change_pct_raw / 100.0 if change_pct_raw is not None else None
         change = _f(31)
 
         bid_prices = [_f(9), _f(11), _f(13), _f(15), _f(17)]
@@ -935,7 +943,10 @@ def _parse_tencent(inst: Instrument, fields: list[str]) -> Quote | None:
         ask_prices = [_f(19), _f(21), _f(23), _f(25), _f(27)]
         ask_vols = [_f(20), _f(22), _f(24), _f(26), _f(28)]
 
-        turnover_pct = _f(38)
+        # ⚡ 2026-07-03 P0-2 修复: 同 change_pct, 腾讯 fields[38] 也是 "百分比 × 100",
+        # 老代码存 222 (raw), 跟东财/新浪的 2.22 不一致。/100 对齐。
+        turnover_pct_raw = _f(38)
+        turnover_pct = turnover_pct_raw / 100.0 if turnover_pct_raw is not None else None
         pe = _f(39)
         # 流通市值 / 总市值：腾讯给的是万元，转为元
         float_cap = _f(44)
@@ -980,6 +991,14 @@ FETCHER_REGISTRY: dict[str, type[BaseFetcher]] = {
     "sina": SinaFetcher,
     "tencent": TencentFetcher,
 }
+
+
+# ⚡ 2026-07-03 P0 修复：DEGRADED WARNING 静默窗口。
+# 历史教训: 2026-07-03 14:44-14:59 实盘 15 分钟, 东财触发 13 次 DEGRADED WARNING
+# (限流常态), 日志 1.67 次/min 刷屏, 真实问题被噪音淹没。
+# 修法: 同源 DEGRADED WARNING 60s 静默窗口, 状态切换 (valid 从 0% 恢复) 仍 WARNING。
+_DEGRADE_WARN_LAST_AT: dict[str, float] = {}
+_DEGRADE_WARN_COOLDOWN = 60.0
 
 
 async def fetch_with_fallback(
@@ -1037,16 +1056,35 @@ async def fetch_with_fallback(
         )
 
         if valid_coverage >= 0.7:
+            # 静默窗口: 同源从 DEGRADED 恢复到 OK 也算"状态切换", WARNING 一次
+            # 让运维看到"恢复了", 然后重置静默计时器
+            last_at = _DEGRADE_WARN_LAST_AT.get(src_name, 0.0)
+            if time.time() - last_at < _DEGRADE_WARN_COOLDOWN:
+                logger.info(
+                    "Source %s RECOVERED from DEGRADED (was warned %.0fs ago)",
+                    src_name, time.time() - last_at,
+                )
+                _DEGRADE_WARN_LAST_AT[src_name] = 0.0  # 重置, 下次降级重新 WARNING
             last_results = results
             last_source = src_name
             return results, src_name
         else:
-            # 显式标记降级原因
-            logger.warning(
-                "Source %s DEGRADED: valid=%d/%d (%.1f%% < 70%%) "
-                "— falling back to next source",
-                src_name, valid, len(instruments), valid_pct,
-            )
+            # 显式标记降级原因, 但 60s 同源静默
+            last_at = _DEGRADE_WARN_LAST_AT.get(src_name, 0.0)
+            if time.time() - last_at >= _DEGRADE_WARN_COOLDOWN:
+                logger.warning(
+                    "Source %s DEGRADED: valid=%d/%d (%.1f%% < 70%%) "
+                    "— falling back to next source",
+                    src_name, valid, len(instruments), valid_pct,
+                )
+                _DEGRADE_WARN_LAST_AT[src_name] = time.time()
+            else:
+                logger.debug(
+                    "Source %s DEGRADED (suppressed, last warn %.0fs ago): "
+                    "valid=%d/%d (%.1f%%)",
+                    src_name, time.time() - last_at,
+                    valid, len(instruments), valid_pct,
+                )
             # 全部源都不达标时，保留有效覆盖最多的一组，而不是无条件返回最后一源。
             previous_valid = sum(1 for q in last_results if q.price is not None)
             if valid > previous_valid:

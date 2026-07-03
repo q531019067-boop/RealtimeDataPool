@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -198,26 +199,87 @@ class InstrumentPool:
 
     @classmethod
     async def _fetch_eastmoney(cls) -> InstrumentPool:
-        """从东方财富分页拉取所有沪深 A 股 + ETF/LOF。"""
+        """从东方财富分页拉取所有沪深 A 股 + ETF/LOF。
+
+        2026-07-03 P0-1 修复：per-page retry + partial-save。
+
+        历史教训（2026-07-03 13:50 实测）：
+        拉 82/123 page 时被限流 Server disconnected,
+        整个 8200 条已抓数据在异常抛出时**全部丢失**,
+        回退到空 cache + 13 个 extra_codes, 99% 标的丢失。
+
+        现在的行为：
+        - 每个 page 拉取失败时 retry 3 次, 退避 0.5s/1s/2s + jitter
+        - 重试都失败时, **不再 raise**, 把已抓的 page 全部写为 partial pool
+          返回 (callers 把 partial pool 写 cache, 下次有 8200 总比 0 强)
+        - partial pool 的 refreshed_at 仍然设当前时间 (TTL 24h 后会自然重试
+          抓全量), 但 `from_config` 在 `force_refresh=True` 路径上仍能立即
+          用上 partial 结果 (比空池好得多)
+        """
         all_items: list[Instrument] = []
         page = 1
         total_expected: int | None = None
+        last_page_failed = False
+        last_page_error: str | None = None
+
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=20),
             headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
         ) as session:
             while True:
                 url = _EASTMONEY_LIST_URL.format(page=page, size=_PAGE_SIZE)
-                async with session.get(url) as resp:
-                    resp.raise_for_status()
-                    payload = await resp.json(content_type=None)
-                data = payload.get("data") or {}
-                diff = data.get("diff") or {}
-                # 东方财富的 diff 是 dict（key="0","1",...）需要转 list
-                items = list(diff.values()) if isinstance(diff, dict) else list(diff)
-                if not items:
+                items: list[dict] | None = None
+
+                # ⚡ Per-page retry: 3 次尝试, 指数退避 + jitter
+                # 捕获 ClientError/Timeout/JSONDecodeError (限流时偶发)
+                for attempt in range(3):
+                    try:
+                        async with session.get(url) as resp:
+                            resp.raise_for_status()
+                            payload = await resp.json(content_type=None)
+                        data = payload.get("data") or {}
+                        diff = data.get("diff") or {}
+                        # 东方财富的 diff 是 dict（key="0","1",...）需要转 list
+                        items = list(diff.values()) if isinstance(diff, dict) else list(diff)
+                        if not items:
+                            # 正常结束: page 返回空 = 已经拉完
+                            break
+                        total_expected = total_expected or data.get("total", 0)
+                        # 成功, 退出 retry loop
+                        break
+                    except (
+                        aiohttp.ClientError,
+                        asyncio.TimeoutError,
+                        json.JSONDecodeError,
+                    ) as exc:
+                        if attempt < 2:
+                            backoff = 0.5 * (2 ** attempt) + random.uniform(0, 0.3)
+                            logger.warning(
+                                "Eastmoney list page %d attempt %d failed: %s, retry in %.1fs",
+                                page, attempt + 1, exc, backoff,
+                            )
+                            await asyncio.sleep(backoff)
+                        else:
+                            # 3 次都失败: 不 raise, 标记 partial
+                            last_page_failed = True
+                            last_page_error = str(exc)
+                            items = None
+                            break
+
+                if not items and not last_page_failed:
+                    # 正常结束 (page 返回空列表)
                     break
-                total_expected = total_expected or data.get("total", 0)
+
+                if last_page_failed:
+                    # 整页失败, 已抓的所有 page 都保留
+                    logger.error(
+                        "Eastmoney list STOPPED at page %d after 3 failed attempts: %s. "
+                        "Returning PARTIAL pool: %d / %s expected items.",
+                        page, last_page_error, len(all_items), total_expected,
+                    )
+                    break
+
+                # 处理 page items (正常路径)
                 for it in items:
                     code = it.get("f12")
                     name = it.get("f14")
