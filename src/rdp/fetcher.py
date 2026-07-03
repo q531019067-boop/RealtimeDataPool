@@ -15,8 +15,11 @@ import random
 import time
 from abc import ABC, abstractmethod
 from collections import deque
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
-from typing import Any, Deque
+from datetime import datetime
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -76,7 +79,7 @@ class _AdaptiveLimiter:
         self._initial = initial
         self._current = initial
         self._in_flight = 0
-        self._waiters: Deque[asyncio.Future[None]] = deque()
+        self._waiters: deque[asyncio.Future[None]] = deque()
 
     @property
     def current(self) -> int:
@@ -106,11 +109,14 @@ class _AdaptiveLimiter:
         try:
             await fut
         except BaseException:
-            # 取消时从 waiters 移除,避免僵尸
+            # 取消时从 waiters 移除,避免僵尸。若 Future 已被唤醒并从队列
+            # 弹出，waker 已经预留了 slot；此时必须归还，否则并发额度会泄漏。
             try:
                 self._waiters.remove(fut)
             except ValueError:
-                pass
+                if fut.done() and not fut.cancelled() and self._in_flight > 0:
+                    self._in_flight -= 1
+                    self._wake_one()
             raise
         # slot 已被 waker 在 _wake_one / adjust 里 +1 预留,这里直接 return
 
@@ -162,7 +168,7 @@ class _AdaptiveLimiter:
         """恢复 initial 上限。返回旧 cap。"""
         return self.adjust(self._initial)
 
-    async def __aenter__(self) -> "_AdaptiveLimiter":
+    async def __aenter__(self) -> _AdaptiveLimiter:
         await self.acquire()
         return self
 
@@ -174,7 +180,7 @@ class _LatencyTracker:
     """滑动窗口：跟踪最近 N 次请求延迟，用于自适应 jitter + 限流检测。"""
 
     def __init__(self, window: int = LATENCY_WINDOW_SIZE):
-        self._samples: Deque[float] = deque(maxlen=window)
+        self._samples: deque[float] = deque(maxlen=window)
 
     def add(self, lat: float) -> None:
         self._samples.append(lat)
@@ -228,6 +234,7 @@ class Quote:
     bid_vols: list[float | None] = field(default_factory=lambda: [None] * 5)
     ask_prices: list[float | None] = field(default_factory=lambda: [None] * 5)
     ask_vols: list[float | None] = field(default_factory=lambda: [None] * 5)
+    orderbook_fetched_at: float | None = None
 
     # 状态
     timestamp: float = 0.0  # 数据源时间戳（秒）
@@ -264,7 +271,8 @@ class BaseFetcher(ABC):
         self._lat_tracker = _LatencyTracker()
         self._throttle_state: str = "normal"  # "normal" | "throttled"
         # 限流/恢复动作的冷却计数器(防 flapping)
-        self._req_since_throttle_action: int = 0
+        # 第一次检测到 THROTTLE 应立即降并发；冷却只约束后续连续 halve。
+        self._req_since_throttle_action: int = CONCURRENCY_HALVE_COOLDOWN
         self._req_since_restore: int = 0
 
     async def __aenter__(self) -> BaseFetcher:
@@ -285,7 +293,7 @@ class BaseFetcher(ABC):
         self._limiter = _AdaptiveLimiter(self.concurrency)
         self._lat_tracker = _LatencyTracker()
         self._throttle_state = "normal"
-        self._req_since_throttle_action = 0
+        self._req_since_throttle_action = CONCURRENCY_HALVE_COOLDOWN
         self._req_since_restore = 0
 
     async def close(self) -> None:
@@ -335,6 +343,7 @@ class BaseFetcher(ABC):
                     new_cap = max(CONCURRENCY_FLOOR, old_cap // 2)
                     if new_cap < old_cap:
                         self._limiter.adjust(new_cap)
+                        self._req_since_throttle_action = 0
                         logger.warning(
                             "%s: HTTP 429 — concurrency %d→%d and penalty jitter enabled",
                             self.name, old_cap, new_cap,
@@ -369,35 +378,38 @@ class BaseFetcher(ABC):
                 self._req_since_throttle_action += 1
                 self._req_since_restore += 1
 
-                if p95 > P95_LATENCY_THRESHOLD_S and self._throttle_state == "normal":
-                    self._throttle_state = "throttled"
+                if p95 > P95_LATENCY_THRESHOLD_S:
+                    just_detected = self._throttle_state == "normal"
+                    if just_detected:
+                        self._throttle_state = "throttled"
                     old_cap = self._limiter.current
-                    # 冷却期内不重复 halve
+                    # 第一次立即 halve；持续高 p95 时每隔 cooldown 请求可继续 halve。
                     if self._req_since_throttle_action >= CONCURRENCY_HALVE_COOLDOWN:
                         new_cap = max(CONCURRENCY_FLOOR, old_cap // 2)
                         if new_cap < old_cap:
                             self._limiter.adjust(new_cap)
                             logger.warning(
-                                "%s: THROTTLE detected — p95=%.2fs > %.1fs, "
+                                "%s: THROTTLE %s — p95=%.2fs > %.1fs, "
                                 "jitter→penalty, concurrency %d→%d (will restore on clear). "
                                 "If persistent, decoupling orderbook fetch helps.",
-                                self.name, p95, P95_LATENCY_THRESHOLD_S,
+                                self.name, "detected" if just_detected else "persists",
+                                p95, P95_LATENCY_THRESHOLD_S,
                                 old_cap, new_cap,
                             )
-                        else:
+                        elif just_detected:
                             logger.warning(
                                 "%s: THROTTLE detected — p95=%.2fs > %.1fs, "
                                 "jitter→penalty, concurrency already at floor %d.",
                                 self.name, p95, P95_LATENCY_THRESHOLD_S, old_cap,
                             )
-                    else:
+                        self._req_since_throttle_action = 0
+                    elif just_detected:
                         logger.warning(
                             "%s: THROTTLE detected — p95=%.2fs > %.1fs, "
                             "jitter→penalty (in cooldown %d/%d, concurrency unchanged).",
                             self.name, p95, P95_LATENCY_THRESHOLD_S,
                             self._req_since_throttle_action, CONCURRENCY_HALVE_COOLDOWN,
                         )
-                    self._req_since_throttle_action = 0
                 elif (
                     p95 < P95_LATENCY_THRESHOLD_S * 0.5
                     and self._throttle_state == "throttled"
@@ -469,7 +481,7 @@ class BaseFetcher(ABC):
         tasks = [self.fetch(i) for i in instruments]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         out: list[Quote] = []
-        for inst, r in zip(instruments, results):
+        for inst, r in zip(instruments, results, strict=True):
             if isinstance(r, Quote):
                 out.append(r)
             elif isinstance(r, Exception):
@@ -557,10 +569,7 @@ class EastmoneyFetcher(BaseFetcher):
         # ⚠️ 东财对 ETF/LOF 的 f152 不可靠（实测 f152=2 但实际是 3 位小数），
         # 会导致 510300/510500/159915 等 ETF 的 price/open/high/low/prev_close 10x 偏大。
         # 用 category 强制覆盖：etf/lof 走 1000，stock 走 f152 或默认 2。
-        if inst.category in ("etf", "lof"):
-            scale = 1000
-        else:
-            scale = 10 ** int(_num("f152") or 2)
+        scale = 1000 if inst.category in ("etf", "lof") else 10 ** int(_num("f152") or 2)
 
         def _price(key: str) -> float | None:
             v = _num(key)
@@ -576,6 +585,7 @@ class EastmoneyFetcher(BaseFetcher):
         if change is not None:
             change = change / scale
 
+        fetched_at = time.time()
         return Quote(
             code=inst.code,
             name=str(data.get("f58") or inst.name),
@@ -601,7 +611,7 @@ class EastmoneyFetcher(BaseFetcher):
             ask_prices=[None] * 5,
             ask_vols=[None] * 5,
             timestamp=ts,
-            fetched_at=time.time(),
+            fetched_at=fetched_at,
             source=self.name,
         )
 
@@ -735,11 +745,10 @@ def _parse_sina(inst: Instrument, fields: list[str]) -> Quote | None:
         # 换手率 / 市值（新浪字段位置在不同版本可能不同，做安全兜底）
         turnover_pct = None
         if len(fields) > 38 and fields[38]:
-            try:
+            with suppress(ValueError):
                 turnover_pct = float(fields[38])
-            except ValueError:
-                pass
 
+        fetched_at = time.time()
         return Quote(
             code=inst.code,
             name=name or inst.name,
@@ -757,7 +766,7 @@ def _parse_sina(inst: Instrument, fields: list[str]) -> Quote | None:
             turnover_pct=turnover_pct,
             bid_prices=bid_prices,
             ask_prices=ask_prices,
-            fetched_at=time.time(),
+            fetched_at=fetched_at,
             source="sina",
         )
     except (ValueError, IndexError):
@@ -929,13 +938,9 @@ def _parse_tencent(inst: Instrument, fields: list[str]) -> Quote | None:
         volume = _f(6)  # 已经是手
         high = _f(33)
         low = _f(34)
-        # ⚡ 2026-07-03 P0-2 修复：腾讯 fields[32] 是 "百分比 × 100" 的 raw 整数
-        # (e.g. +2.22% → raw 222)。老代码直接 _f(32) 存进 db 是 222,
-        # 跟东财/新浪的 2.22 差 100 倍, 导致 /api/snapshots/all?sort_by=change_pct
-        # 排序时, 腾讯源的标的全在 top/bottom 极端位置 (错位 100x)。
-        # 修法: 跟东财/新浪对齐, 都存**百分比值** (2.22 = +2.22%)。
-        change_pct_raw = _f(32)
-        change_pct = change_pct_raw / 100.0 if change_pct_raw is not None else None
+        # 腾讯 fields[32]/[38] 已经是百分比值（-0.11 表示 -0.11%），
+        # 不再二次 /100。2026-07-03 单标的协议 smoke 已核对原始响应。
+        change_pct = _f(32)
         change = _f(31)
 
         bid_prices = [_f(9), _f(11), _f(13), _f(15), _f(17)]
@@ -943,19 +948,28 @@ def _parse_tencent(inst: Instrument, fields: list[str]) -> Quote | None:
         ask_prices = [_f(19), _f(21), _f(23), _f(25), _f(27)]
         ask_vols = [_f(20), _f(22), _f(24), _f(26), _f(28)]
 
-        # ⚡ 2026-07-03 P0-2 修复: 同 change_pct, 腾讯 fields[38] 也是 "百分比 × 100",
-        # 老代码存 222 (raw), 跟东财/新浪的 2.22 不一致。/100 对齐。
-        turnover_pct_raw = _f(38)
-        turnover_pct = turnover_pct_raw / 100.0 if turnover_pct_raw is not None else None
+        turnover_pct = _f(38)
         pe = _f(39)
-        # 流通市值 / 总市值：腾讯给的是万元，转为元
+        # fields[37] 成交额单位万元；fields[44]/[45] 市值单位亿元。
+        amount = _f(37)
+        if amount is not None:
+            amount *= 1e4
         float_cap = _f(44)
         if float_cap is not None:
-            float_cap = float_cap * 1e4
+            float_cap *= 1e8
         market_cap = _f(45)
         if market_cap is not None:
-            market_cap = market_cap * 1e4
+            market_cap *= 1e8
 
+        timestamp = 0.0
+        raw_timestamp = fields[30].strip() if len(fields) > 30 else ""
+        if len(raw_timestamp) >= 14:
+            with suppress(ValueError):
+                timestamp = datetime.strptime(raw_timestamp[:14], "%Y%m%d%H%M%S").replace(
+                    tzinfo=ZoneInfo("Asia/Shanghai")
+                ).timestamp()
+
+        fetched_at = time.time()
         return Quote(
             code=inst.code,
             name=name,
@@ -969,6 +983,7 @@ def _parse_tencent(inst: Instrument, fields: list[str]) -> Quote | None:
             change=change,
             change_pct=change_pct,
             volume=volume,
+            amount=amount,
             turnover_pct=turnover_pct,
             pe=pe,
             market_cap=market_cap,
@@ -977,7 +992,9 @@ def _parse_tencent(inst: Instrument, fields: list[str]) -> Quote | None:
             bid_vols=bid_vols,
             ask_prices=ask_prices,
             ask_vols=ask_vols,
-            fetched_at=time.time(),
+            orderbook_fetched_at=fetched_at,
+            timestamp=timestamp,
+            fetched_at=fetched_at,
             source="tencent",
         )
     except Exception:
@@ -999,6 +1016,34 @@ FETCHER_REGISTRY: dict[str, type[BaseFetcher]] = {
 # 修法: 同源 DEGRADED WARNING 60s 静默窗口, 状态切换 (valid 从 0% 恢复) 仍 WARNING。
 _DEGRADE_WARN_LAST_AT: dict[str, float] = {}
 _DEGRADE_WARN_COOLDOWN = 60.0
+
+
+def _with_stale_placeholders(
+    results: list[Quote],
+    instruments: list[Instrument],
+    source: str | None,
+) -> list[Quote]:
+    """为最终仍缺失的标的补 stale 快照，避免数据库继续暴露旧行情。"""
+    seen = {q.code for q in results}
+    if len(seen) == len(instruments):
+        return results
+    completed = list(results)
+    fetched_at = time.time()
+    for inst in instruments:
+        if inst.code in seen:
+            continue
+        completed.append(
+            Quote(
+                code=inst.code,
+                name=inst.name,
+                market=inst.market,
+                category=inst.category,
+                fetched_at=fetched_at,
+                source=source or "unavailable",
+                is_stale=True,
+            )
+        )
+    return completed
 
 
 async def fetch_with_fallback(
@@ -1067,7 +1112,7 @@ async def fetch_with_fallback(
                 _DEGRADE_WARN_LAST_AT[src_name] = 0.0  # 重置, 下次降级重新 WARNING
             last_results = results
             last_source = src_name
-            return results, src_name
+            return _with_stale_placeholders(results, instruments, src_name), src_name
         else:
             # 显式标记降级原因, 但 60s 同源静默
             last_at = _DEGRADE_WARN_LAST_AT.get(src_name, 0.0)
@@ -1091,4 +1136,4 @@ async def fetch_with_fallback(
                 last_results = results
                 last_source = src_name
 
-    return last_results, last_source
+    return _with_stale_placeholders(last_results, instruments, last_source), last_source

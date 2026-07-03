@@ -1,5 +1,9 @@
 """Instrument 数据模型测试。"""
 
+import time
+
+import pytest
+
 from rdp.instruments import Instrument, InstrumentPool, _apply_pool_config
 
 
@@ -190,6 +194,7 @@ class TestInstrumentPoolByCode:
     def test_by_code_works_with_12000_instruments(self):
         """⚡ 性能:12K 池子,by_code 1000 次应该 < 100ms(O(1) 字典)"""
         import time
+
         from rdp.instruments import Instrument
         # 构造 12K instrument
         insts = [
@@ -225,3 +230,70 @@ class TestInstrumentPoolByCode:
         assert out.by_code("X") is not None
         assert out.by_code("Y") is not None
         assert out.by_code("Z") is None
+
+
+class TestInstrumentPoolCacheSafety:
+    def test_legacy_empty_cache_is_treated_as_partial(self):
+        pool = InstrumentPool.from_json(
+            '{"refreshed_at": 1, "instruments": []}'
+        )
+        assert pool.is_partial is True
+
+    @pytest.mark.asyncio
+    async def test_partial_refresh_does_not_overwrite_complete_cache(
+        self, tmp_path, monkeypatch
+    ):
+        cache_path = tmp_path / "instruments.json"
+        complete = InstrumentPool(
+            instruments=[Instrument("000001", "平安", "sz")],
+            refreshed_at=time.time() - 86400,
+        )
+        cache_path.write_text(complete.to_json(), encoding="utf-8")
+
+        async def fake_fetch(cls):
+            return InstrumentPool(
+                instruments=[], refreshed_at=time.time(), is_partial=True
+            )
+
+        monkeypatch.setattr(
+            InstrumentPool, "_fetch_eastmoney", classmethod(fake_fetch)
+        )
+        result = await InstrumentPool.from_config(
+            {}, cache_path, force_refresh=True
+        )
+
+        assert result.codes() == ["000001"]
+        cached_after = InstrumentPool.from_json(cache_path.read_text(encoding="utf-8"))
+        assert cached_after.codes() == ["000001"]
+        assert cached_after.is_partial is False
+
+    @pytest.mark.asyncio
+    async def test_partial_cache_uses_short_ttl(self, tmp_path, monkeypatch):
+        cache_path = tmp_path / "instruments.json"
+        partial = InstrumentPool(
+            instruments=[Instrument("000001", "平安", "sz")],
+            refreshed_at=time.time() - 301,
+            is_partial=True,
+        )
+        cache_path.write_text(partial.to_json(), encoding="utf-8")
+        called = False
+
+        async def fake_fetch(cls):
+            nonlocal called
+            called = True
+            return InstrumentPool(
+                instruments=[
+                    Instrument("000001", "平安", "sz"),
+                    Instrument("600000", "浦发", "sh"),
+                ],
+                refreshed_at=time.time(),
+            )
+
+        monkeypatch.setattr(
+            InstrumentPool, "_fetch_eastmoney", classmethod(fake_fetch)
+        )
+        result = await InstrumentPool.from_config({}, cache_path)
+
+        assert called is True
+        assert result.codes() == ["000001", "600000"]
+        assert result.is_partial is False

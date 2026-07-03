@@ -146,3 +146,32 @@ class TestStorage:
                 assert row["bid_prices"][0] is None
             else:
                 assert row["bid_prices"][0] == 99.0
+
+    def test_latest_price_is_not_replaced_by_older_orderbook_row(self, storage: Storage):
+        """盘口来自旧周期时，价格和 stale 状态仍必须来自最新基础行情。"""
+        storage.upsert_instruments([Instrument(code="000001", name="x", market="sz")])
+        storage.insert_snapshot(Quote(
+            code="000001", name="x", market="sz", price=10.0,
+            fetched_at=1000.0, source="eastmoney",
+        ))
+        storage.update_snapshot_orderbook(
+            "000001",
+            [9.99] + [None] * 4, [100] + [None] * 4,
+            [10.01] + [None] * 4, [200] + [None] * 4,
+            orderbook_fetched_at=1001.0,
+        )
+        storage.insert_snapshot(Quote(
+            code="000001", name="x", market="sz", price=11.0,
+            fetched_at=2000.0, source="eastmoney", is_stale=True,
+        ))
+
+        latest = storage.query_latest(["000001"])[0]
+        assert latest["price"] == 11.0
+        assert latest["fetched_at"] == 2000.0
+        assert latest["is_stale"] is True
+        assert latest["bid_prices"][0] == 9.99
+        assert latest["orderbook_fetched_at"] == 1001.0
+
+        paged = storage.query_latest_paged(limit=10)
+        assert paged[0]["price"] == 11.0
+        assert paged[0]["bid_prices"][0] == 9.99

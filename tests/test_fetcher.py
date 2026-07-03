@@ -1,8 +1,19 @@
 """Fetcher 解析逻辑测试（不发起真实请求）。"""
 
+import asyncio
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import pytest
 
-from rdp.fetcher import Quote, _parse_sina, _parse_tencent, fetch_with_fallback
+from rdp.fetcher import (
+    EastmoneyFetcher,
+    Quote,
+    _AdaptiveLimiter,
+    _parse_sina,
+    _parse_tencent,
+    fetch_with_fallback,
+)
 from rdp.instruments import Instrument
 
 
@@ -43,11 +54,15 @@ class TestTencentParser:
         fields[10] = "100"   # 买一量
         fields[19] = "10.51" # 卖一价
         fields[20] = "200"   # 卖一量
-        fields[37] = "10.80" # 最高
-        fields[38] = "10.30" # 最低
-        fields[44] = "5.00"  # 涨跌幅
-        fields[45] = "0.50"  # 涨跌额
-        fields[49] = "3000000000"  # 流通市值
+        fields[30] = "20260703145959"  # 行情时间（北京时间）
+        fields[31] = "0.50"   # 涨跌额
+        fields[32] = "5.00"   # 涨跌幅（已经是百分比）
+        fields[33] = "10.80"  # 最高
+        fields[34] = "10.30"  # 最低
+        fields[37] = "105.5"  # 成交额（万元）
+        fields[38] = "1.25"   # 换手率（已经是百分比）
+        fields[44] = "300.0"  # 流通市值（亿元）
+        fields[45] = "400.0"  # 总市值（亿元）
         q = _parse_tencent(inst, fields)
         assert q is not None
         assert q.name == "浦发银行"
@@ -55,6 +70,14 @@ class TestTencentParser:
         assert q.change_pct == pytest.approx(5.0)
         assert q.bid_prices[0] == pytest.approx(10.49)
         assert q.ask_prices[0] == pytest.approx(10.51)
+        assert q.amount == pytest.approx(1_055_000)
+        assert q.turnover_pct == pytest.approx(1.25)
+        assert q.float_cap == pytest.approx(30_000_000_000)
+        assert q.market_cap == pytest.approx(40_000_000_000)
+        assert q.timestamp == datetime(
+            2026, 7, 3, 14, 59, 59, tzinfo=ZoneInfo("Asia/Shanghai")
+        ).timestamp()
+        assert q.orderbook_fetched_at == q.fetched_at
 
     def test_too_short(self):
         inst = Instrument(code="x", name="x", market="sz")
@@ -205,6 +228,7 @@ class TestFetchWithFallbackSignature:
     def test_signature_returns_tuple(self):
         """签名应该是 (results, source_used) 不是 list[Quote]"""
         import inspect
+
         from rdp.fetcher import fetch_with_fallback
         sig = inspect.signature(fetch_with_fallback)
         ret = sig.return_annotation
@@ -277,4 +301,76 @@ class TestFetchWithFallbackCoverage:
             instruments, ["better-test", "worse-test"], jitter_ms=0
         )
         assert source == "better-test"
-        assert len(quotes) == 6
+        assert len(quotes) == len(instruments)
+        assert sum(q.price is not None for q in quotes) == 6
+        assert sum(q.is_stale for q in quotes) == 4
+
+    @pytest.mark.asyncio
+    async def test_healthy_threshold_still_marks_missing_codes_stale(self, monkeypatch):
+        instruments = [
+            Instrument(code=f"{i:06d}", name=str(i), market="sz") for i in range(10)
+        ]
+
+        class SeventyPercentFetcher:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def fetch_batch(self, requested):
+                return [Quote(code=i.code, price=1.0) for i in requested[:7]]
+
+        registry = __import__("rdp.fetcher", fromlist=["FETCHER_REGISTRY"]).FETCHER_REGISTRY
+        monkeypatch.setitem(registry, "seventy-test", SeventyPercentFetcher)
+
+        quotes, source = await fetch_with_fallback(
+            instruments, ["seventy-test"], jitter_ms=0
+        )
+        assert source == "seventy-test"
+        assert len(quotes) == 10
+        assert sum(q.is_stale for q in quotes) == 3
+
+
+class TestAdaptiveLimiter:
+    @pytest.mark.asyncio
+    async def test_first_high_p95_immediately_halves_concurrency(self, monkeypatch):
+        import rdp.fetcher as fetcher_module
+
+        class Response:
+            status = 200
+            headers = {}
+
+        class Session:
+            async def get(self, *args, **kwargs):
+                return Response()
+
+        monkeypatch.setattr(fetcher_module, "JITTER_PENALTY_MIN_MS", 0)
+        monkeypatch.setattr(fetcher_module, "JITTER_PENALTY_MAX_MS", 0)
+        fetcher = EastmoneyFetcher(concurrency=8, jitter_ms=0)
+        fetcher._session = Session()
+        fetcher._limiter = _AdaptiveLimiter(8)
+        for _ in range(100):
+            fetcher._lat_tracker.add(2.0)
+
+        await fetcher._polite_get("https://example.invalid")
+
+        assert fetcher._throttle_state == "throttled"
+        assert fetcher._limiter.current == 4
+
+    @pytest.mark.asyncio
+    async def test_cancelled_woken_waiter_returns_reserved_slot(self):
+        limiter = _AdaptiveLimiter(1)
+        await limiter.acquire()
+        waiter = asyncio.create_task(limiter.acquire())
+        await asyncio.sleep(0)
+
+        await limiter.release()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        assert limiter.in_flight == 0

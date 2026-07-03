@@ -1,6 +1,6 @@
 """交易时段判断的单元测试。"""
 
-from datetime import datetime, time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -82,6 +82,7 @@ class TestRunOnceOrderbookStats:
     def test_run_once_signature_documented(self):
         """run_once 应该返回 dict 包含 'orderbook' key"""
         import inspect
+
         from rdp.scheduler import Scheduler
         sig = inspect.signature(Scheduler.run_once)
         assert sig.return_annotation != inspect.Signature.empty

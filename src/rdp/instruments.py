@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
-import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +45,9 @@ _EASTMONEY_LIST_URL = (
 )
 
 _PAGE_SIZE = 100  # 东方财富硬上限：单页最多 100 条
+_MIN_EXPECTED_POOL_SIZE = 1000  # 全 A 股正常应 5000+；低于此值视为被截断
 _DEFAULT_CACHE_TTL_SEC = 24 * 3600  # 缓存 1 天
+_PARTIAL_CACHE_TTL_SEC = 5 * 60  # 残缺/空池只缓存 5 分钟，尽快重试
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,7 @@ class InstrumentPool:
 
     instruments: list[Instrument] = field(default_factory=list)
     refreshed_at: float = 0.0
+    is_partial: bool = False
     # ⚡ 性能优化 2026-07-02：O(1) dict 索引。
     # 原 by_code 是 O(N) 线性扫，scheduler 的 _run_orderbook 调用 12K 次
     # × 12K = 1.44 亿次比较。改成 dict 索引后 = 12K 次。
@@ -136,6 +138,7 @@ class InstrumentPool:
         return json.dumps(
             {
                 "refreshed_at": self.refreshed_at,
+                "is_partial": self.is_partial,
                 "instruments": [i.to_dict() for i in self.instruments],
             },
             ensure_ascii=False,
@@ -145,9 +148,12 @@ class InstrumentPool:
     def from_json(cls, raw: str) -> InstrumentPool:
         d = json.loads(raw)
         # __post_init__ 会自动建 _index
+        instruments = [Instrument.from_dict(x) for x in d["instruments"]]
         return cls(
-            instruments=[Instrument.from_dict(x) for x in d["instruments"]],
+            instruments=instruments,
             refreshed_at=d.get("refreshed_at", 0.0),
+            # 兼容旧缓存：空池即使没有 is_partial 标记也不能视为健康缓存。
+            is_partial=bool(d.get("is_partial", False) or not instruments),
         )
 
     @classmethod
@@ -159,41 +165,55 @@ class InstrumentPool:
     ) -> InstrumentPool:
         """根据配置加载股票池。
 
-        优先级：cache → fetch fresh → fallback to empty。
-        """
-        ttl = _DEFAULT_CACHE_TTL_SEC
+        优先级：健康 cache → fetch fresh → stale 健康 cache → partial/empty。
 
-        # 1. 尝试从缓存加载
-        if not force_refresh and cache_path.exists():
+        partial/empty cache 使用 5 分钟短 TTL；新抓取结果若比已有健康缓存更差，
+        不覆盖旧缓存，避免一次限流让整个股票池消失 24 小时。
+        """
+        cached_pool: InstrumentPool | None = None
+        if cache_path.exists():
             try:
-                pool = cls.from_json(cache_path.read_text(encoding="utf-8"))
-                if time.time() - pool.refreshed_at < ttl:
+                cached_pool = cls.from_json(cache_path.read_text(encoding="utf-8"))
+                ttl = _PARTIAL_CACHE_TTL_SEC if cached_pool.is_partial else _DEFAULT_CACHE_TTL_SEC
+                if not force_refresh and time.time() - cached_pool.refreshed_at < ttl:
                     logger.info(
-                        "Loaded instrument pool from cache: %d codes (age %.1f h)",
-                        len(pool),
-                        (time.time() - pool.refreshed_at) / 3600,
+                        "Loaded %s instrument pool from cache: %d codes (age %.1f min)",
+                        "PARTIAL" if cached_pool.is_partial else "complete",
+                        len(cached_pool),
+                        (time.time() - cached_pool.refreshed_at) / 60,
                     )
-                    return _apply_pool_config(pool, pool_cfg)
+                    return _apply_pool_config(cached_pool, pool_cfg)
             except Exception as exc:
                 logger.warning("Failed to load instrument cache: %s", exc)
 
-        # 2. 抓取最新
         try:
             pool = await cls._fetch_eastmoney()
         except Exception as exc:
             logger.error("Failed to fetch instrument list: %s", exc)
-            # 如果抓取失败但有缓存，强制用旧缓存
-            if cache_path.exists():
+            if cached_pool is not None and len(cached_pool) > 0:
                 logger.warning("Using stale cache as fallback")
-                pool = cls.from_json(cache_path.read_text(encoding="utf-8"))
+                pool = cached_pool
             else:
                 logger.warning("No instruments loaded — pool is empty")
-                pool = cls(instruments=[], refreshed_at=time.time())
+                pool = cls(instruments=[], refreshed_at=time.time(), is_partial=True)
 
-        # 3. 写缓存
+        if (
+            pool.is_partial
+            and cached_pool is not None
+            and len(cached_pool) > len(pool)
+        ):
+            logger.warning(
+                "Fetched PARTIAL pool (%d codes); preserving larger stale cache (%d codes)",
+                len(pool), len(cached_pool),
+            )
+            return _apply_pool_config(cached_pool, pool_cfg)
+
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(pool.to_json(), encoding="utf-8")
-        logger.info("Refreshed instrument pool: %d codes", len(pool))
+        logger.info(
+            "Refreshed instrument pool: %d codes%s",
+            len(pool), " (PARTIAL, short TTL)" if pool.is_partial else "",
+        )
 
         return _apply_pool_config(pool, pool_cfg)
 
@@ -212,15 +232,15 @@ class InstrumentPool:
         - 每个 page 拉取失败时 retry 3 次, 退避 0.5s/1s/2s + jitter
         - 重试都失败时, **不再 raise**, 把已抓的 page 全部写为 partial pool
           返回 (callers 把 partial pool 写 cache, 下次有 8200 总比 0 强)
-        - partial pool 的 refreshed_at 仍然设当前时间 (TTL 24h 后会自然重试
-          抓全量), 但 `from_config` 在 `force_refresh=True` 路径上仍能立即
-          用上 partial 结果 (比空池好得多)
+        - partial pool 会显式标记 `is_partial=True`，只使用 5 分钟短 TTL；
+          若已有更完整的健康缓存，则保留旧缓存且不被 partial/empty 覆盖
         """
         all_items: list[Instrument] = []
         page = 1
         total_expected: int | None = None
         last_page_failed = False
         last_page_error: str | None = None
+        hit_safety_cap = False
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=20),
@@ -307,11 +327,22 @@ class InstrumentPool:
                 page += 1
                 if page > 200:  # 安全上限：20000 只
                     logger.warning("Hit pagination safety cap")
+                    hit_safety_cap = True
                     break
                 # 礼貌延时，避免被反爬
                 await asyncio.sleep(0.3)
 
-        return cls(instruments=all_items, refreshed_at=time.time())
+        is_partial = (
+            last_page_failed
+            or hit_safety_cap
+            or len(all_items) < _MIN_EXPECTED_POOL_SIZE
+            or (total_expected is not None and len(all_items) < total_expected)
+        )
+        return cls(
+            instruments=all_items,
+            refreshed_at=time.time(),
+            is_partial=is_partial,
+        )
 
 
 def _apply_pool_config(pool: InstrumentPool, cfg: dict[str, Any]) -> InstrumentPool:
@@ -378,7 +409,11 @@ def _apply_pool_config(pool: InstrumentPool, cfg: dict[str, Any]) -> InstrumentP
         max_size if max_size else "unlimited",
     )
     # ⚡ __post_init__ 会自动建 _index
-    return InstrumentPool(instruments=kept, refreshed_at=pool.refreshed_at)
+    return InstrumentPool(
+        instruments=kept,
+        refreshed_at=pool.refreshed_at,
+        is_partial=pool.is_partial,
+    )
 
 
 async def _demo() -> None:  # pragma: no cover — 手动验证用

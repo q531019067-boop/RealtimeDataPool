@@ -25,7 +25,6 @@ from .instruments import InstrumentPool
 from .scheduler import Scheduler, is_trading_session
 from .storage import Storage
 
-
 ROOT = Path(__file__).resolve().parent.parent.parent  # src/rdp/cli.py -> project root
 
 
@@ -111,11 +110,27 @@ async def _serve(cfg: dict, host: str, port: int) -> None:
     logger.info("=" * 60)
 
     try:
-        await asyncio.gather(sched_task, server_task)
+        done, _ = await asyncio.wait(
+            {sched_task, server_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if sched_task in done:
+            # 调度器不应自行结束；若异常退出，关闭 API 并把异常抛给上层。
+            await sched_task
+            server.should_exit = True
+            await server_task
+        else:
+            # uvicorn 收到退出信号后 server_task 会先结束，随后进入 finally
+            # 主动停止调度器，不能再 gather 无限循环任务。
+            await server_task
     except asyncio.CancelledError:
         pass
     finally:
         await sched.stop()
+        for task in (sched_task, server_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(sched_task, server_task, return_exceptions=True)
         storage.close()
 
 
@@ -164,7 +179,7 @@ def _status(cfg: dict) -> None:
         storage.close()
     print(f"Instruments: {len(instruments)}")
     print(f"Snapshots: {snapshot_count}")
-    print(f"Last 5 runs:")
+    print("Last 5 runs:")
     for r in runs:
         print(
             f"  #{r['id']} {r['started_at']:.0f} src={r['source']} "

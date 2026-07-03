@@ -14,14 +14,17 @@ import json
 import logging
 import sqlite3
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from .fetcher import Quote
 from .instruments import Instrument
 
 logger = logging.getLogger(__name__)
+
+_ORDERBOOK_FIELDS = ("bid_prices", "bid_vols", "ask_prices", "ask_vols")
 
 
 SCHEMA_SQL = """
@@ -247,47 +250,59 @@ class Storage:
         是 correlated subquery，12K codes 跑下来 = 1.44 亿次比较。改成 GROUP BY MAX(id) 走
         idx_snapshots_code_time 索引（loose index scan），实测下降 50-100x。
 
-        ⚡ 2026-07-03 P0 修复：优先返回有盘口的最新行。
-        历史教训：basic 周期 30s 插新行 (无盘口), OB 周期 5min 改最新行 (有盘口)。
-        修法前: query_latest 返回最新无盘口行, /api/snapshot 用户 9/10 时间拿 [None, None, ...]。
-        修法后: 优先返回有盘口的最新行 (OB 周期拉的, 5min 内), 没盘口才降级到任意最新。
-        Trade-off: 价格数据可能滞后 5min (OB 周期是 5min 一次), 但盘口可用性从 0% → 99%+。
+        基础行情始终取最新行；盘口从最近一次带 orderbook_fetched_at 的行合并。
+        这样既不会为了盘口把 price/fetched_at 回退到旧周期，也能在两个盘口周期之间
+        持续返回最近一次五档数据。
         """
         code_filter = ""
-        params: tuple = ()
+        params: tuple[Any, ...] = ()
         if codes:
             placeholders = ",".join(["?"] * len(codes))
             code_filter = f"WHERE code IN ({placeholders})"
             params = tuple(codes)
 
         sql = f"""
-            SELECT s.code, s.fetched_at, s.source, s.is_stale, s.data_json,
-                   i.name, i.market, i.category
-            FROM snapshots s
-            JOIN (
-                SELECT code,
-                       COALESCE(
-                           MAX(CASE WHEN json_extract(data_json, '$.orderbook_fetched_at') IS NOT NULL
-                                     AND json_extract(data_json, '$.orderbook_fetched_at') != 'null'
-                                THEN id END),
-                           MAX(id)
-                       ) AS max_id
+            WITH latest AS (
+                SELECT code, MAX(id) AS max_id
                 FROM snapshots
                 {code_filter}
                 GROUP BY code
-            ) latest ON s.id = latest.max_id
+            ), latest_orderbook AS (
+                SELECT candidate.code, MAX(candidate.id) AS max_id
+                FROM snapshots candidate
+                JOIN latest ON latest.code = candidate.code
+                WHERE json_type(candidate.data_json, '$.orderbook_fetched_at')
+                      IN ('integer', 'real')
+                GROUP BY candidate.code
+            )
+            SELECT s.code, s.fetched_at, s.source, s.is_stale, s.data_json,
+                   ob.data_json AS orderbook_json,
+                   i.name, i.market, i.category
+            FROM latest
+            JOIN snapshots s ON s.id = latest.max_id
             JOIN instruments i ON s.code = i.code
+            LEFT JOIN latest_orderbook lob ON lob.code = s.code
+            LEFT JOIN snapshots ob ON ob.id = lob.max_id
             ORDER BY s.code
         """
 
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
 
-        out: list[dict[str, Any]] = []
-        for r in rows:
-            data = json.loads(r["data_json"])
-            out.append(data)
-        return out
+        return [self._merge_latest_with_orderbook(r) for r in rows]
+
+    @staticmethod
+    def _merge_latest_with_orderbook(row: sqlite3.Row) -> dict[str, Any]:
+        """保留最新基础行情，只从历史盘口行复制盘口字段。"""
+        data = json.loads(row["data_json"])
+        orderbook_json = row["orderbook_json"]
+        if not orderbook_json:
+            return data
+        orderbook = json.loads(orderbook_json)
+        for field in _ORDERBOOK_FIELDS:
+            data[field] = orderbook.get(field, [None] * 5)
+        data["orderbook_fetched_at"] = orderbook.get("orderbook_fetched_at")
+        return data
 
     # 可在 SQL 里排序的白名单字段(都从 data_json 里 json_extract)
     # 注意:fetched_at 在主表上,不走 json_extract
@@ -328,10 +343,11 @@ class Storage:
             raise ValueError(f"order must be 'asc' or 'desc', got {order!r}")
 
         # fetched_at 是快照主表字段,其它走 json_extract
-        if sort_by == "fetched_at":
-            sort_expr = "s.fetched_at"
-        else:
-            sort_expr = f"json_extract(s.data_json, '$.{sort_by}')"
+        sort_expr = (
+            "s.fetched_at"
+            if sort_by == "fetched_at"
+            else f"json_extract(s.data_json, '$.{sort_by}')"
+        )
 
         where_parts: list[str] = []
         params: list[Any] = []
@@ -347,24 +363,28 @@ class Storage:
 
         where_sql = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
-        # ⚡ 2026-07-03 P0 修复：跟 query_latest 一致, 优先选有盘口的最新行
-        # (OB 周期 5min 一次, basic 30s 一次, 优先 OB 周期行保证盘口可用)
+        # 跟 query_latest 一致：排序/过滤使用最新基础行情，盘口单独合并。
         sql = f"""
-            SELECT s.code, s.fetched_at, s.source, s.is_stale, s.data_json,
-                   i.name, i.market, i.category
-            FROM snapshots s
-            JOIN (
-                SELECT code,
-                       COALESCE(
-                           MAX(CASE WHEN json_extract(data_json, '$.orderbook_fetched_at') IS NOT NULL
-                                     AND json_extract(data_json, '$.orderbook_fetched_at') != 'null'
-                                THEN id END),
-                           MAX(id)
-                       ) AS max_id
+            WITH latest AS (
+                SELECT code, MAX(id) AS max_id
                 FROM snapshots
                 GROUP BY code
-            ) latest ON s.id = latest.max_id
+            ), latest_orderbook AS (
+                SELECT candidate.code, MAX(candidate.id) AS max_id
+                FROM snapshots candidate
+                JOIN latest ON latest.code = candidate.code
+                WHERE json_type(candidate.data_json, '$.orderbook_fetched_at')
+                      IN ('integer', 'real')
+                GROUP BY candidate.code
+            )
+            SELECT s.code, s.fetched_at, s.source, s.is_stale, s.data_json,
+                   ob.data_json AS orderbook_json,
+                   i.name, i.market, i.category
+            FROM latest
+            JOIN snapshots s ON s.id = latest.max_id
             JOIN instruments i ON s.code = i.code
+            LEFT JOIN latest_orderbook lob ON lob.code = s.code
+            LEFT JOIN snapshots ob ON ob.id = lob.max_id
             {where_sql}
             ORDER BY {sort_expr} {order.upper()} NULLS LAST
             LIMIT ?
@@ -374,11 +394,7 @@ class Storage:
         with self._connect() as conn:
             rows = conn.execute(sql, tuple(params)).fetchall()
 
-        out: list[dict[str, Any]] = []
-        for r in rows:
-            data = json.loads(r["data_json"])
-            out.append(data)
-        return out
+        return [self._merge_latest_with_orderbook(r) for r in rows]
 
     def query_history(
         self, code: str, limit: int = 100, since: float | None = None

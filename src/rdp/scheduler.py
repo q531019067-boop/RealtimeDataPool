@@ -14,7 +14,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, time as dtime
+from contextlib import suppress
+from datetime import datetime
+from datetime import time as dtime
 from pathlib import Path
 
 from .fetcher import TencentFetcher, fetch_with_fallback
@@ -39,9 +41,7 @@ def is_trading_session(now: datetime | None = None) -> bool:
     if dtime(9, 15) <= t < dtime(11, 30):
         return True
     # 13:00:00-15:00:00（连续竞价；收盘瞬间 14:59:59 算，最后一秒算）
-    if dtime(13, 0) <= t < dtime(15, 0):
-        return True
-    return False
+    return dtime(13, 0) <= t < dtime(15, 0)
 
 
 class Scheduler:
@@ -401,10 +401,8 @@ class Scheduler:
         self._running = False
         if self._task is not None:
             self._task.cancel()
-            try:
+            with suppress(asyncio.CancelledError, Exception):
                 await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
             self._task = None
         logger.info("Scheduler stopped")
 
@@ -444,7 +442,6 @@ async def _demo() -> None:  # pragma: no cover
 
 
 if __name__ == "__main__":  # pragma: no cover
-    import yaml
 
     logging.basicConfig(level=logging.INFO)
     asyncio.run(_demo())
